@@ -21,7 +21,7 @@ class BaseOptions():
 		parser.add_argument('--sampling_rate', type=int, default=16000)
 		parser.add_argument('--audio_marcing', type=int, default=2, help='number of adjacent frames. For value v, t -> [t-v, ..., t, ..., t+v]')        
 		parser.add_argument('--wav2vec_sec', default=2, type=float, help='window length L (seconds), 50 frames')
-		parser.add_argument('--wav2vec_model_path', default='./wav2vec2-base-960h')
+		parser.add_argument('--wav2vec_model_path', default='./checkpoints/wav2vec2-base-960h')
 		parser.add_argument('--audio2emotion_path', default='./checkpoints/wav2vec-english-speech-emotion-recognition')
 		parser.add_argument('--attention_window', default=5, type=int, help='attention window size, e.g., if 1, attend frames of t-1, t, t+1 for frame t')
 

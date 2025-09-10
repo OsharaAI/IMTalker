@@ -4,12 +4,7 @@
 
 import os, torch, random, cv2, torchvision, subprocess, librosa, datetime, tempfile, face_alignment
 import numpy as np
-import albumentations as A
-import albumentations.pytorch.transforms as A_pytorch
 
-from tqdm import tqdm
-from pathlib import Path
-from traitlets import default
 from transformers import Wav2Vec2FeatureExtractor
 
 from models.float.CFMT_gaze_smirk import ConditionFMT
