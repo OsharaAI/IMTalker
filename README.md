@@ -99,7 +99,7 @@ If you find our work useful for your research, please consider citing:
 ```bibtex
 @article{imtalker2025,
   title={IMTalker: Efficient Audio-driven Talking Face Generation with Implicit Motion Transfer},
-  author={Bo, Chen and Xie, Chen}, 
+  author={Bo, Chen and Tao, Liu and Qi, Chen and  Xie, Chen and  Zilong Zheng}, 
   journal={arXiv preprint arXiv:25xx.xxxxx},
   year={2025}
 }
