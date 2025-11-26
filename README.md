@@ -108,7 +108,12 @@ To obtain the highest quality generation results, we recommend following these g
 
 3.  **Background Quality**: 
     We strongly recommend using source images with **solid colored** or **blurred (bokeh)** backgrounds. Complex or highly detailed backgrounds may lead to visual artifacts or jitter in the generated video.
-    
+
+## 📝 To-Do List
+- [x] Release inference code and pretrained models.
+- [x] Launch Hugging Face online demo.
+- [ ] Release training code and data preprocessing scripts.
+
 ## 📜 Citation
 If you find our work useful for your research, please consider citing:
 
