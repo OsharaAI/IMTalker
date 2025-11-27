@@ -413,7 +413,6 @@ def fn_video_driven(source_image, driving_video, crop, progress=gr.Progress()):
 with gr.Blocks(title="IMTalker Demo") as demo:
     gr.Markdown("# 🗣️ IMTalker: Efficient Audio-driven Talking Face Generation")
     
-    # 最佳实践说明
     with gr.Accordion("💡 Best Practices (Click to read)", open=False):
         gr.Markdown("""
         To obtain the highest quality generation results, we recommend following these guidelines:
@@ -456,11 +455,8 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                         cache_examples=False,
                     )
 
-                    # 2. 音频输入
                     a_aud = gr.Audio(label="Driving Audio", type="filepath")
 
-                    # --- 音频示例 (独立) ---
-                    # 请确保 examples 文件夹下有对应的 audio_x.wav 文件
                     gr.Examples(
                         examples=[
                             ["assets/audio_1.wav"],
@@ -493,10 +489,8 @@ with gr.Blocks(title="IMTalker Demo") as demo:
         with gr.TabItem("Video Driven"):
             with gr.Row():
                 with gr.Column():
-                    # 1. 图片输入
                     v_img = gr.Image(label="Source Image", type="numpy", height=512, width=512)
                     
-                    # --- 图片示例 (独立) ---
                     gr.Examples(
                         examples=[
                             ["assets/source_1.png"],
@@ -511,11 +505,8 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                         cache_examples=False,
                     )
 
-                    # 2. 视频输入
                     v_vid = gr.Video(label="Driving Video", sources=["upload"], height=512, width=512)
 
-                    # --- 视频示例 (独立) ---
-                    # 请确保 examples 文件夹下有对应的 driving_x.mp4 文件
                     gr.Examples(
                         examples=[
                             ["assets/driving_1.mp4"],
