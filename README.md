@@ -19,7 +19,8 @@ IMTalker accepts diverse portrait styles and achieves 40 FPS for video-driven an
 </div>
 
 ## 📢 News
-- **[2025.11]** 🚀 The inference code and pretrained weights are released!
+- **[2025.12.16]** 🚀 The training code are released!
+- **[2025.11.27]** 🚀 The inference code and pretrained weights are released!
 ## 🛠️ Installation
 
 ### 1. Environment Setup
@@ -94,6 +95,67 @@ python renderer/inference.py \
     --crop
 ```
 
+## 🚀 Train
+
+### 1. Train the renderer
+#### Data Preparation
+You can follow the dataset processing pipeline in [talkingfaceprocess](https://github.com/liutaocode/talking_face_preprocessing) to crop the raw video data into 512×512 resolution videos where the face occupies the main region, and to extract landmarks for each video. Ensure your dataset directory is organized as follows.
+```text
+/path/to/renderer_dataset
+├── video_frame
+    ├── video_0001
+      ├── image_001.jpg
+      ├── image_002.jpg
+      ├── ...
+    ├── video_0002
+    ├── ...
+├── lmd
+    ├── video_0001.txt
+    ├── video_0002.txt
+    ├── ...
+```
+#### Training Command
+Then you can execute the following command to train our renderer. In our experiments, we used 4 × A100 (80 GB) GPUs; with a batch size of 4, the GPU memory usage did not exceed 50 GB, and each iteration took approximately 1 second. You can adjust the batch size and learning rate according to your hardware configuration.
+```text
+python renderer/train.py \
+    --dataset_path /path/to/renderer_dataset \
+    --exp_name renderer_exp \
+    --batch_size 4 \
+    --iter 7000000 \
+    --lr 1e-4 \
+```
+### 2. Train the generator
+#### Data Preparation
+In the second step, you need to train our motion generator to enable speech-driven animation. To accelerate training, we pre-extract and store all required features, including: motion latents obtained by feeding each video frame into the motion encoder in the renderer; final-layer features extracted from audio WAV files using [Wav2Vec2](https://huggingface.co/facebook/wav2vec2-base-960h); 6D pose parameters for each frame extracted with [SMIRK](https://github.com/georgeretsi/smirk); and gaze directions extracted using [L2CS-Net](https://github.com/Ahmednull/L2CS-Net). Ensure your dataset directory is organized as follows.
+```text
+/path/to/generator_dataset
+├── motion
+    ├── video_0001.pt
+    ├── video_0002.pt
+    ├── ...
+├── audio
+    ├── video_0001.npy
+    ├── video_0002.npy
+    ├── ...
+├── smirk
+    ├── video_0001.pt
+    ├── video_0002.pt
+    ├── ...
+├── gaze
+    ├── video_0001.npy
+    ├── video_0002.npy
+    ├── ...
+```
+#### Training Command
+Then you can execute the following command to train the generator. In our experiments, we used 4 × A100 (80 GB) GPUs; with a batch size of 16, the GPU memory usage did not exceed 20 GB, achieving approximately 10 iterations per second, and the model converged within a few hours. You can adjust the batch size and learning rate according to your hardware configuration.
+```text
+python generator/train.py \
+    --dataset_pat /path/to/generator_dataset \
+    --exp_name generator_exp \
+    --batch_size 16 \
+    --iter 5000000 \
+    --lr 1e-4
+```
 ## 💡 Best Practices
 
 To obtain the highest quality generation results, we recommend following these guidelines:
@@ -112,7 +174,7 @@ To obtain the highest quality generation results, we recommend following these g
 ## 📝 To-Do List
 - [x] Release inference code and pretrained models.
 - [x] Launch Hugging Face online demo.
-- [ ] Release training code and data preprocessing scripts.
+- [x] Release training code.
 
 ## 📜 Citation
 If you find our work useful for your research, please consider citing:

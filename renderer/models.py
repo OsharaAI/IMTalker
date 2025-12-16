@@ -13,6 +13,7 @@ class IdentityEncoder(nn.Module):
             nn.BatchNorm2d(initial_channels),
             nn.ReLU(inplace=True)
         )
+        self.down_block_0 = DownConvResBlock(initial_channels, initial_channels)
         self.down_blocks = nn.ModuleList()
         current_channels = initial_channels
         for out_channels in output_channels:
@@ -27,6 +28,7 @@ class IdentityEncoder(nn.Module):
     def forward(self, x):
         features = []
         x = self.initial_conv(x)
+        x = self.down_block_0(x)
         features.append(x)
         for block in self.down_blocks:
             x = block(x)

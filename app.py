@@ -81,7 +81,7 @@ class AppConfig:
         self.renderer_path = "./checkpoints/renderer.ckpt"
         self.generator_path = "./checkpoints/generator.ckpt"
         self.wav2vec_model_path = "./checkpoints/wav2vec2-base-960h"
-        self.input_size = 256
+        self.input_size = 512
         self.input_nc = 3
         self.fps = 25.0
         self.rank = "cuda" 
@@ -136,7 +136,7 @@ class DataProcessor:
         else:
             print("Local wav2vec model not found, downloading from 'facebook/wav2vec2-base-960h'...")
             self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-base-960h")
-        self.transform = transforms.Compose([transforms.Resize((256, 256)), transforms.ToTensor()])
+        self.transform = transforms.Compose([transforms.Resize((512, 512)), transforms.ToTensor()])
 
     def process_img(self, img: Image.Image) -> Image.Image:
         img_arr = np.array(img)
@@ -469,10 +469,10 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                     )
                     
                     with gr.Accordion("Settings", open=True):
-                        a_crop = gr.Checkbox(label="Auto Crop Face", value=True)
+                        a_crop = gr.Checkbox(label="Auto Crop Face", value=False)
                         a_seed = gr.Number(label="Seed", value=42)
                         a_nfe = gr.Slider(5, 50, value=10, step=1, label="Steps (NFE)")
-                        a_cfg = gr.Slider(1.0, 5.0, value=3.0, label="CFG Scale")
+                        a_cfg = gr.Slider(1.0, 5.0, value=2.0, label="CFG Scale")
                         
                     a_btn = gr.Button("Generate (Audio Driven)", variant="primary")
                     

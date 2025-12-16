@@ -25,7 +25,7 @@ class DataProcessor:
         self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
         
         self.transform = transforms.Compose([
-            transforms.Resize((256, 256)), 
+            transforms.Resize((512, 512)), 
             transforms.ToTensor(),
         ])
 
@@ -119,7 +119,6 @@ class Demo(nn.Module):
             source_img = self.processor.process_img(source_img)
         
         source_tensor = self.processor.transform(source_img).unsqueeze(0).to(self.device)
-
         # 2. Encode Source Appearance & Motion
         f_r, i_r = self.gen.app_encode(source_tensor)
         t_r = self.gen.mot_encode(source_tensor)
@@ -208,7 +207,7 @@ if __name__ == '__main__':
 
     # Model Params
     parser.add_argument("--renderer_path", type=str, default="./checkpoints/renderer.ckpt", help="Checkpoint path")
-    parser.add_argument("--input_size", type=int, default=256, help="Resolution")
+    parser.add_argument("--input_size", type=int, default=512, help="Resolution")
     parser.add_argument('--swin_res_threshold', type=int, default=128)
     parser.add_argument('--num_heads', type=int, default=8)
     parser.add_argument('--window_size', type=int, default=8)
