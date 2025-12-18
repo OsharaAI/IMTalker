@@ -304,7 +304,7 @@ class InferenceAgent:
         if audio_path:
             with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_out:
                 final_path = tmp_out.name
-            cmd = f'ffmpeg -y -i "{raw_path}" -i "{audio_path}" -c:v copy -c:a aac -shortest "{final_path}" -loglevel error'
+            cmd = f'ffmpeg -y -i "{raw_path}" -i "{audio_path}" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "{final_path}" '
             subprocess.call(cmd, shell=True)
             if os.path.exists(raw_path): os.remove(raw_path)
             return final_path
