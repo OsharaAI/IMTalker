@@ -517,7 +517,7 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                         cache_examples=False,
                     )
 
-                    v_crop = gr.Checkbox(label="Auto Crop (Both Source & Driving)", value=True)
+                    v_crop = gr.Checkbox(label="Auto Crop (Both Source & Driving)", value=False)
                     v_btn = gr.Button("Generate (Video Driven)", variant="primary")
                     
                 with gr.Column():
