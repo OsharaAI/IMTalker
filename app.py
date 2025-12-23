@@ -304,7 +304,7 @@ class InferenceAgent:
         if audio_path:
             with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_out:
                 final_path = tmp_out.name
-            cmd = f'ffmpeg -y -i "{raw_path}" -i "{audio_path}" -c:v copy -c:a aac -shortest "{final_path}" -loglevel error'
+            cmd = f'ffmpeg -y -i "{raw_path}" -i "{audio_path}" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "{final_path}"'
             subprocess.call(cmd, shell=True)
             if os.path.exists(raw_path): os.remove(raw_path)
             return final_path
@@ -367,7 +367,7 @@ class InferenceAgent:
         if temp_crop_video and os.path.exists(temp_crop_video): os.remove(temp_crop_video)
         if not vid_results: raise Exception("Driving video reading failed.")
         vid_tensor = torch.cat(vid_results, dim=0)
-        return self.save_video(vid_tensor, fps=fps, audio_path=None)
+        return self.save_video(vid_tensor, fps=fps, audio_path=driving_video_path)
 
 print("Initializing Configuration...")
 cfg = AppConfig()
@@ -491,12 +491,11 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                     
                     gr.Examples(
                         examples=[
-                            ["assets/source_1.png"],
-                            ["assets/source_2.png"],
-                            ["assets/source_3.jpg"],
-                            ["assets/source_4.png"],
-                            ["assets/source_5.png"],
-                            ["assets/source_6.png"],
+                            ["assets/source_7.png"],
+                            ["assets/source_8.png"],
+                            ["assets/source_9.png"],
+                            ["assets/source_10.png"],
+                            ["assets/source_11.png"],
                         ],
                         inputs=[v_img],
                         label="Example Images",
@@ -511,6 +510,7 @@ with gr.Blocks(title="IMTalker Demo") as demo:
                             ["assets/driving_2.mp4"],
                             ["assets/driving_3.mp4"],
                             ["assets/driving_4.mp4"],
+                            ["assets/driving_5.mp4"],
                         ],
                         inputs=[v_vid],
                         label="Example Videos",
@@ -526,5 +526,4 @@ with gr.Blocks(title="IMTalker Demo") as demo:
             v_btn.click(fn_video_driven, [v_img, v_vid, v_crop], v_out)
 
 if __name__ == "__main__":
-
     demo.launch(share=False)

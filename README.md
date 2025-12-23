@@ -29,6 +29,7 @@ IMTalker accepts diverse portrait styles and achieves 40 FPS for video-driven an
 conda create -n IMTalker python=3.10
 conda activate IMTalker
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+conda install -c conda-forge ffmpeg 
 ```
 
 **2. Install with pip:**
@@ -80,7 +81,7 @@ python generator/generate.py \
     --res_dir "./results/" \
     --generator_path "./checkpoints/generator.ckpt" \
     --renderer_path "./checkpoints/renderer.ckpt" \
-    --a_cfg_scale 3 \
+    --a_cfg_scale 2 \
     --crop
 ```
 ### 2. Video-driven Inference
