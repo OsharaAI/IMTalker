@@ -103,7 +103,7 @@ async def health():
 async def audio_driven_inference(
     image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
     audio: UploadFile = File(..., description="Driving audio file (WAV, MP3)"),
-    crop: bool = Form(False, description="Auto crop face from image"),
+    crop: bool = Form(True, description="Auto crop face from image"),
     seed: int = Form(42, description="Random seed for generation"),
     nfe: int = Form(10, description="Number of function evaluations (steps), range: 5-50"),
     cfg_scale: float = Form(2.0, description="Classifier-free guidance scale, range: 1.0-5.0")
