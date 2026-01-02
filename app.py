@@ -312,7 +312,32 @@ class InferenceAgent:
             return raw_path
 
     @torch.no_grad()
+    def run_audio_inference_streaming(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
+        """Stream frames as they are generated for audio-driven inference."""
+        s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
+        s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+        a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
+        data = {'s': s_tensor, 'a': a_tensor, 'pose': None, 'cam': None, 'gaze': None, 'ref_x': None}
+        f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
+        t_lat = self.renderer.latent_token_encoder(s_tensor)
+        if isinstance(t_lat, tuple): t_lat = t_lat[0]
+        data['ref_x'] = t_lat
+        torch.manual_seed(seed)
+        sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+        T = sample.shape[1]
+        ta_r = self.renderer.adapt(t_lat, g_r)
+        m_r = self.renderer.latent_token_decoder(ta_r)
+        
+        # Yield frames one by one
+        for t in range(T):
+            ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+            m_c = self.renderer.latent_token_decoder(ta_c)
+            out_frame = self.renderer.decode(m_c, m_r, f_r)
+            yield out_frame.squeeze(0)  # Yield single frame tensor (C, H, W)
+    
+    @torch.no_grad()
     def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
+        """Legacy batch method - collects all frames and saves video."""
         s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
@@ -336,7 +361,40 @@ class InferenceAgent:
         return self.save_video(vid_tensor, self.opt.fps, aud_path)
 
     @torch.no_grad()
+    def run_video_inference_streaming(self, source_img_pil, driving_video_path, crop):
+        """Stream frames as they are generated for video-driven inference."""
+        s_pil = self.data_processor.process_img(source_img_pil) if crop else source_img_pil.resize((self.opt.input_size, self.opt.input_size))
+        s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+        f_r, i_r = self.renderer.app_encode(s_tensor)
+        t_r = self.renderer.mot_encode(s_tensor)
+        ta_r = self.renderer.adapt(t_r, i_r)
+        ma_r = self.renderer.mot_decode(ta_r)
+        final_driving_path = driving_video_path
+        temp_crop_video = None
+        if crop:
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp: temp_crop_video = tmp.name
+            self.data_processor.crop_video_stable(driving_video_path, temp_crop_video)
+            final_driving_path = temp_crop_video
+        cap = cv2.VideoCapture(final_driving_path)
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_pil = Image.fromarray(frame).resize((self.opt.input_size, self.opt.input_size))
+                d_tensor = self.data_processor.transform(frame_pil).unsqueeze(0).to(self.device)
+                t_c = self.renderer.mot_encode(d_tensor)
+                ta_c = self.renderer.adapt(t_c, i_r)
+                ma_c = self.renderer.mot_decode(ta_c)
+                out = self.renderer.decode(ma_c, ma_r, f_r)
+                yield out.squeeze(0).cpu()  # Yield single frame (C, H, W)
+        finally:
+            cap.release()
+            if temp_crop_video and os.path.exists(temp_crop_video): os.remove(temp_crop_video)
+    
+    @torch.no_grad()
     def run_video_inference(self, source_img_pil, driving_video_path, crop):
+        """Legacy batch method - collects all frames and saves video."""
         s_pil = self.data_processor.process_img(source_img_pil) if crop else source_img_pil.resize((self.opt.input_size, self.opt.input_size))
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         f_r, i_r = self.renderer.app_encode(s_tensor)

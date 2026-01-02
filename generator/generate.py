@@ -141,7 +141,44 @@ class InferenceAgent:
                 if name in stripped_state_dict:
                     param.copy_(stripped_state_dict[name].to(rank))
 
+    def save_video_streaming(self, frame_generator, video_path, audio_path, frame_count=None):
+        """Save video with streaming frame generation."""
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+            temp_filename = tmp.name
+        
+        writer = None
+        try:
+            for frame in frame_generator:
+                # Convert frame tensor to numpy
+                frame_np = frame.permute(1, 2, 0).detach().clamp(-1, 1).cpu().numpy()
+                frame_np = ((frame_np + 1) * 127.5).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                
+                # Initialize writer on first frame
+                if writer is None:
+                    h, w = frame_bgr.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(temp_filename, fourcc, self.opt.fps, (w, h))
+                
+                writer.write(frame_bgr)
+            
+            if writer is not None:
+                writer.release()
+            
+            # Mux audio if provided
+            if audio_path and os.path.exists(audio_path):
+                cmd = f"ffmpeg -i {temp_filename} -i {audio_path} -c:v copy -c:a aac {video_path} -y"
+                subprocess.call(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.rename(temp_filename, video_path)
+        finally:
+            if os.path.exists(temp_filename) and os.path.exists(video_path):
+                os.remove(temp_filename)
+        
+        return video_path
+
     def save_video(self, vid_tensor, video_path, audio_path):
+        """Legacy method for backward compatibility."""
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
             temp_filename = tmp.name
             
@@ -177,9 +214,14 @@ class InferenceAgent:
         data["ref_x"] = t_r
 
         sample = self.fm.sample(data, a_cfg_scale=kwargs.get('a_cfg_scale', 1.0), nfe=kwargs.get('nfe', 10), seed=kwargs.get('seed', 25))
-        data_out = self.decode_image(f_r, t_r, sample, g_r)
         
-        return self.save_video(data_out["d_hat"], res_path, aud_path)
+        # Use streaming if enabled
+        if kwargs.get('streaming', True):
+            frame_gen = self.decode_image_streaming(f_r, t_r, sample, g_r)
+            return self.save_video_streaming(frame_gen, res_path, aud_path)
+        else:
+            data_out = self.decode_image(f_r, t_r, sample, g_r)
+            return self.save_video(data_out["d_hat"], res_path, aud_path)
 
     @torch.no_grad()
     def encode_image(self, x):
@@ -188,7 +230,21 @@ class InferenceAgent:
         return f, t, g
     
     @torch.no_grad()
+    def decode_image_streaming(self, f_r, t_r, t_c, g_r):
+        """Generator that yields frames one at a time for streaming."""
+        T = t_c.shape[1]
+        ta_r = self.ae.adapt(t_r, g_r)
+        m_r = self.ae.latent_token_decoder(ta_r)
+        
+        for t in range(T):
+            ta_c = self.ae.adapt(t_c[:, t, ...], g_r)
+            m_c = self.ae.latent_token_decoder(ta_c)
+            frame = self.ae.decode(m_c, m_r, f_r)
+            yield frame.squeeze(0)  # Yield single frame
+    
+    @torch.no_grad()
     def decode_image(self, f_r, t_r, t_c, g_r):
+        """Legacy batch decoding method."""
         T = t_c.shape[1]
         ta_r = self.ae.adapt(t_r, g_r)
         m_r = self.ae.latent_token_decoder(ta_r)
