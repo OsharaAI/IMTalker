@@ -6,28 +6,50 @@ Provides REST API endpoints for audio-driven and video-driven talking face gener
 import os
 import sys
 import tempfile
-import shutil
-import io
 import subprocess
-import glob
-import base64
-from pathlib import Path
-from typing import Optional, Generator
-import uuid
-
-import torch
 import numpy as np
 import cv2
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
+import torch
+import torchvision
+import librosa
+import face_alignment
+import json
+import math
+import gradio as gr
 from PIL import Image
+import torchvision.transforms as transforms
+from transformers import Wav2Vec2FeatureExtractor
+from tqdm import tqdm
+import random
+from huggingface_hub import hf_hub_download
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import shutil
+from pathlib import Path
+import uuid
+import asyncio
+from typing import Optional
+import threading
+import time
+import queue
+
 
 # Add current directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from app import AppConfig, InferenceAgent, ensure_checkpoints
+from app import AppConfig, ensure_checkpoints, DataProcessor
+
+# Try importing local modules
+try:
+    from generator.FM import FMGenerator
+    from renderer.models import IMTRenderer
+except ImportError as e:
+    print(f"Import Error: {e}")
+    print("Please ensure 'generator' and 'renderer' folders are in the same directory.")
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -49,6 +71,400 @@ app.add_middleware(
 cfg = None
 agent = None
 output_dir = "./outputs"
+
+# HLS session storage for live streaming
+import threading
+from dataclasses import dataclass, field
+from typing import Dict, List
+import time
+
+
+
+
+class InferenceAgent:
+    def __init__(self, opt):
+        # Clear cache only if CUDA is available
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.opt = opt
+        self.device = opt.device
+        self.data_processor = DataProcessor(opt)
+        print("Loading Models...")
+        self.renderer = IMTRenderer(self.opt).to(self.device)
+        self.generator = FMGenerator(self.opt).to(self.device)
+        if not os.path.exists(self.opt.renderer_path) or not os.path.exists(
+            self.opt.generator_path
+        ):
+            raise FileNotFoundError(
+                "Checkpoints not found even after download attempt."
+            )
+        self._load_ckpt(self.renderer, self.opt.renderer_path, "gen.")
+        self._load_fm_ckpt(self.generator, self.opt.generator_path)
+        self.renderer.eval()
+        self.generator.eval()
+        print("Models loaded successfully.")
+
+    def _load_ckpt(self, model, path, prefix="gen."):
+        if not os.path.exists(path):
+            print(f"Warning: Checkpoint {path} not found.")
+            return
+        checkpoint = torch.load(path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        clean_state_dict = {
+            k.replace(prefix, ""): v
+            for k, v in state_dict.items()
+            if k.startswith(prefix)
+        }
+        model.load_state_dict(clean_state_dict, strict=False)
+
+    def _load_fm_ckpt(self, model, path):
+        if not os.path.exists(path):
+            return
+        checkpoint = torch.load(path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        if "model" in state_dict:
+            state_dict = state_dict["model"]
+        prefix = "model."
+        clean_dict = {
+            k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)
+        }
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in clean_dict:
+                    param.copy_(clean_dict[name].to(self.device))
+
+    def save_video(self, vid_tensor, fps, audio_path=None):
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            raw_path = tmp.name
+        if vid_tensor.dim() == 4:
+            vid = vid_tensor.permute(0, 2, 3, 1).detach().cpu().numpy()
+        if vid.min() < 0:
+            vid = (vid + 1) / 2
+        vid = np.clip(vid, 0, 1)
+        vid = (vid * 255).astype(np.uint8)
+        height, width = vid.shape[1], vid.shape[2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(raw_path, fourcc, fps, (width, height))
+        for frame in vid:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        if audio_path:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_out:
+                final_path = tmp_out.name
+            cmd = f'ffmpeg -y -i "{raw_path}" -i "{audio_path}" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "{final_path}"'
+            subprocess.call(cmd, shell=True)
+            if os.path.exists(raw_path):
+                os.remove(raw_path)
+            return final_path
+        else:
+            return raw_path
+
+    @torch.no_grad()
+    def run_audio_inference(
+        self,
+        img_pil,
+        aud_path,
+        crop,
+        seed,
+        nfe,
+        cfg_scale,
+        pose_style=None,
+        gaze_style=None,
+    ):
+        # Clear memory before starting
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        s_pil = (
+            self.data_processor.process_img(img_pil)
+            if crop
+            else img_pil.resize((self.opt.input_size, self.opt.input_size))
+        )
+        s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+        a_tensor = (
+            self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
+        )
+        data = {
+            "s": s_tensor,
+            "a": a_tensor,
+            "pose": None,
+            "cam": None,
+            "gaze": None,
+            "ref_x": None,
+        }
+
+        # Handle Advanced Controls (Pose & Gaze)
+        # Calculate target frame count T based on audio length
+        T = math.ceil(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+
+        if pose_style is not None:
+            # pose_style is [pitch, yaw, roll] -> Create (1, T, 3) tensor
+            # Using simple expansion for static pose offset
+            p_tensor = (
+                torch.tensor(pose_style, device=self.device)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand(1, T, 3)
+            )
+            data["pose"] = p_tensor
+
+        if gaze_style is not None:
+            # gaze_style is [x, y] -> Create (1, T, 2) tensor
+            g_tensor = (
+                torch.tensor(gaze_style, device=self.device)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand(1, T, 2)
+            )
+            data["gaze"] = g_tensor
+        f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
+        t_lat = self.renderer.latent_token_encoder(s_tensor)
+        if isinstance(t_lat, tuple):
+            t_lat = t_lat[0]
+        data["ref_x"] = t_lat
+        torch.manual_seed(seed)
+        sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+
+        # Stabilization: blend generated motion with reference motion to reduce large background/head movements
+        # This addresses the user's request for "steady and calm" motion.
+        motion_scale = 0.6  # More stabilization for steadier result (was 0.75)
+        sample = (1.0 - motion_scale) * t_lat.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
+
+        d_hat = []
+        T = sample.shape[1]
+        ta_r = self.renderer.adapt(t_lat, g_r)
+        m_r = self.renderer.latent_token_decoder(ta_r)
+        for t in range(T):
+            ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+            m_c = self.renderer.latent_token_decoder(ta_c)
+            out_frame = self.renderer.decode(m_c, m_r, f_r)
+            # Move to CPU immediately to save memory
+            d_hat.append(out_frame.cpu())
+            # Clear cache periodically
+            if t % 10 == 0 and self.device == "mps":
+                torch.mps.empty_cache()
+        vid_tensor = torch.stack(d_hat, dim=1).squeeze(0)
+
+        # Final cleanup
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        return self.save_video(vid_tensor, self.opt.fps, aud_path)
+
+    @torch.no_grad()
+    def run_audio_inference_streaming(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
+        """Stream frames as they are generated for audio-driven inference."""
+        s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
+        s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+        a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
+        data = {'s': s_tensor, 'a': a_tensor, 'pose': None, 'cam': None, 'gaze': None, 'ref_x': None}
+        f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
+        t_lat = self.renderer.latent_token_encoder(s_tensor)
+        if isinstance(t_lat, tuple): t_lat = t_lat[0]
+        data['ref_x'] = t_lat
+        torch.manual_seed(seed)
+        sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+        T = sample.shape[1]
+        ta_r = self.renderer.adapt(t_lat, g_r)
+        m_r = self.renderer.latent_token_decoder(ta_r)
+        
+        # Yield frames one by one
+        for t in range(T):
+            ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+            m_c = self.renderer.latent_token_decoder(ta_c)
+            out_frame = self.renderer.decode(m_c, m_r, f_r)
+            yield out_frame.squeeze(0)  # Yield single frame tensor (C, H, W)
+
+    @torch.no_grad()
+    def run_audio_inference_progressive(
+        self,
+        img_pil,
+        aud_path,
+        crop,
+        seed,
+        nfe,
+        cfg_scale,
+        hls_generator: "ProgressiveHLSGenerator",
+        pose_style=None,
+        gaze_style=None,
+    ):
+        """Run audio inference with progressive HLS generation"""
+        # Clear memory before starting
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        s_pil = (
+            self.data_processor.process_img(img_pil)
+            if crop
+            else img_pil.resize((self.opt.input_size, self.opt.input_size))
+        )
+        s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+        a_tensor = (
+            self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
+        )
+        data = {
+            "s": s_tensor,
+            "a": a_tensor,
+            "pose": None,
+            "cam": None,
+            "gaze": None,
+            "ref_x": None,
+        }
+        
+        # Handle Advanced Controls (Pose & Gaze)
+        T_est = math.ceil(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+
+        if pose_style is not None:
+            p_tensor = (
+                torch.tensor(pose_style, device=self.device)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand(1, T_est, 3)
+            )
+            data["pose"] = p_tensor
+
+        if gaze_style is not None:
+            g_tensor = (
+                torch.tensor(gaze_style, device=self.device)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .expand(1, T_est, 2)
+            )
+            data["gaze"] = g_tensor
+
+        f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
+        t_lat = self.renderer.latent_token_encoder(s_tensor)
+        if isinstance(t_lat, tuple):
+            t_lat = t_lat[0]
+        data["ref_x"] = t_lat
+        torch.manual_seed(seed)
+        sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+
+        # Stabilization: blend generated motion with reference motion to reduce large background/head movements
+        motion_scale = 0.6  # More stabilization (was 0.75)
+        sample = (1.0 - motion_scale) * t_lat.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
+
+
+        T = sample.shape[1]
+        ta_r = self.renderer.adapt(t_lat, g_r)
+        m_r = self.renderer.latent_token_decoder(ta_r)
+
+        # Generate frames progressively
+        for t in range(T):
+            ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+            m_c = self.renderer.latent_token_decoder(ta_c)
+            out_frame = self.renderer.decode(m_c, m_r, f_r)
+
+            # Convert frame to numpy for HLS generator
+            frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+            if frame_np.min() < 0:
+                frame_np = (frame_np + 1) / 2
+            frame_np = np.clip(frame_np, 0, 1)
+            frame_np = (frame_np * 255).astype(np.uint8)
+
+            # Add frame to HLS generator (will create segments automatically)
+            hls_generator.add_frame(frame_np)
+
+            # Clear cache periodically
+            if t % 10 == 0 and self.device == "mps":
+                torch.mps.empty_cache()
+
+        # Finalize HLS stream with audio
+        hls_generator.finalize(audio_path=aud_path)
+
+        # Final cleanup
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def run_video_inference(self, source_img_pil, driving_video_path, crop):
+        # Clear memory before starting
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        s_pil = (
+            self.data_processor.process_img(source_img_pil)
+            if crop
+            else source_img_pil.resize((self.opt.input_size, self.opt.input_size))
+        )
+        s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+        f_r, i_r = self.renderer.app_encode(s_tensor)
+        t_r = self.renderer.mot_encode(s_tensor)
+        ta_r = self.renderer.adapt(t_r, i_r)
+        ma_r = self.renderer.mot_decode(ta_r)
+        final_driving_path = driving_video_path
+        temp_crop_video = None
+        if crop:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                temp_crop_video = tmp.name
+            self.data_processor.crop_video_stable(driving_video_path, temp_crop_video)
+            final_driving_path = temp_crop_video
+        cap = cv2.VideoCapture(final_driving_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        vid_results = []
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame).resize(
+                (self.opt.input_size, self.opt.input_size)
+            )
+            d_tensor = (
+                self.data_processor.transform(frame_pil).unsqueeze(0).to(self.device)
+            )
+            t_c = self.renderer.mot_encode(d_tensor)
+            ta_c = self.renderer.adapt(t_c, i_r)
+            ma_c = self.renderer.mot_decode(ta_c)
+            out = self.renderer.decode(ma_c, ma_r, f_r)
+            vid_results.append(out.cpu())
+
+            # Clear cache periodically
+            frame_count += 1
+            if frame_count % 10 == 0 and self.device == "mps":
+                torch.mps.empty_cache()
+
+        cap.release()
+        if temp_crop_video and os.path.exists(temp_crop_video):
+            os.remove(temp_crop_video)
+        if not vid_results:
+            raise Exception("Driving video reading failed.")
+        vid_tensor = torch.cat(vid_results, dim=0)
+
+        # Final cleanup
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        return self.save_video(vid_tensor, fps=fps, audio_path=driving_video_path)
+
+
+
+@dataclass
+class HLSSession:
+    """Represents an active HLS streaming session."""
+    session_id: str
+    temp_dir: str
+    target_duration: int
+    segments: List[dict] = field(default_factory=list)
+    is_complete: bool = False
+    total_frames: int = 0
+    created_at: float = field(default_factory=time.time)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+hls_sessions: Dict[str, HLSSession] = {}
 
 @app.on_event("startup")
 async def startup_event():
@@ -105,217 +521,250 @@ async def health():
     }
 
 
-def create_fmp4_chunk(frames: list, audio_path: str, start_frame: int, fps: float = 25.0, temp_dir: str = "/tmp") -> bytes:
+# Create directories for HLS output
+HLS_OUTPUT_DIR = Path("hls_output")
+HLS_OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Mount static files for serving HLS segments and playlists (Use S3 or CDN later)
+app.mount("/hls", StaticFiles(directory=str(HLS_OUTPUT_DIR)), name="hls")
+
+# Store generation status
+generation_status = {}
+
+
+class ProgressiveHLSGenerator:
+    """Generate HLS segments progressively as frames are created"""
+
+    def __init__(
+        self,
+        session_id: str,
+        fps: float = 25.0,
+        segment_duration: int = 4,
+        audio_path: Optional[str] = None,
+    ):
+        self.session_id = session_id
+        self.fps = fps
+        self.segment_duration = segment_duration
+        self.audio_path = audio_path
+        self.frames_per_segment = int(fps * segment_duration)
+        self.output_dir = HLS_OUTPUT_DIR / session_id
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.current_segment = 0
+        self.frame_buffer = []
+        self.segment_files = []
+        self.is_complete = False
+        self.total_frames = 0
+
+        print(f"[HLS {self.session_id}] Initialized - FPS: {fps}, Segment Duration: {segment_duration}s, Frames per segment: {self.frames_per_segment}")
+        print(f"[HLS {self.session_id}] Output directory: {self.output_dir}")
+        print(f"[HLS {self.session_id}] Audio path: {self.audio_path}")
+
+        # Create initial empty playlist so HLS player can start loading
+        self._create_initial_playlist()
+
+    def add_frame(self, frame: np.ndarray):
+        """Add a frame to the buffer and create segment if buffer is full"""
+        self.frame_buffer.append(frame)
+        self.total_frames += 1
+
+        if self.total_frames % 25 == 0:  # Log every second of video
+            print(f"[HLS {self.session_id}] Progress: {self.total_frames} frames, buffer: {len(self.frame_buffer)}/{self.frames_per_segment}")
+
+        if len(self.frame_buffer) >= self.frames_per_segment:
+            print(f"[HLS {self.session_id}] Buffer full ({len(self.frame_buffer)} frames), writing segment...")
+            self._write_segment()
+            self._update_playlist()
+
+    def _create_initial_playlist(self):
+        """Create an initial empty playlist for HLS player to start loading"""
+        playlist_path = self.output_dir / "playlist.m3u8"
+        target_duration = self.segment_duration + 1
+
+        with open(playlist_path, "w") as f:
+            f.write("#EXTM3U\n")
+            f.write("#EXT-X-VERSION:3\n")
+            f.write(f"#EXT-X-TARGETDURATION:{target_duration}\n")
+            f.write("#EXT-X-MEDIA-SEQUENCE:0\n")
+            # No segments yet, player will poll for updates
+
+    def _write_segment(self):
+        """Write buffered frames as an HLS segment"""
+        if not self.frame_buffer:
+            print(f"[HLS {self.session_id}] No frames in buffer, skipping segment write")
+            return
+
+        segment_file = self.output_dir / f"segment{self.current_segment:03d}.ts"
+        temp_video = self.output_dir / f"temp_segment{self.current_segment:03d}.mp4"
+
+        print(f"[HLS {self.session_id}] Writing segment {self.current_segment} with {len(self.frame_buffer)} frames")
+
+        try:
+            # Write frames to temporary MP4
+            height, width = self.frame_buffer[0].shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(temp_video), fourcc, self.fps, (width, height))
+
+            for frame in self.frame_buffer:
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            writer.release()
+
+            if not temp_video.exists() or temp_video.stat().st_size == 0:
+                print(f"[HLS {self.session_id}] ERROR: Temp video file not created or empty")
+                return
+
+            print(f"[HLS {self.session_id}] Temp video created: {temp_video.stat().st_size} bytes")
+
+            # Calculate start time for this segment (used for audio slice AND timestamp offset)
+            start_time = self.current_segment * self.segment_duration
+            duration = len(self.frame_buffer) / self.fps
+
+            cmd = ["ffmpeg", "-y", "-i", str(temp_video)]
+
+            if self.audio_path and os.path.exists(self.audio_path):
+                print(f"[HLS {self.session_id}] Adding audio from {start_time:.3f}s for {duration:.3f}s")
+                cmd.extend([
+                    "-ss", f"{start_time:.3f}",
+                    "-t", f"{duration:.3f}",
+                    "-i", self.audio_path,
+                    "-map", "0:v",
+                    "-map", "1:a",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-ac", "2",
+                ])
+            else:
+                print(f"[HLS {self.session_id}] No audio provided for segment")
+
+            # Apply timestamp offset to ensure HLS continuity
+            cmd.extend(["-output_ts_offset", f"{start_time:.3f}"])
+
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                "-f", "mpegts",
+                "-y",
+                str(segment_file),
+            ])
+
+            print(f"[HLS {self.session_id}] Running FFmpeg: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                print(f"[HLS {self.session_id}] FFmpeg ERROR: {result.stderr}")
+                raise Exception(f"FFmpeg failed: {result.stderr}")
+
+            # Verify segment was created
+            if not segment_file.exists():
+                print(f"[HLS {self.session_id}] ERROR: Segment file not created!")
+                raise Exception("Segment file not created")
+            
+            segment_size = segment_file.stat().st_size
+            print(f"[HLS {self.session_id}] ✓ Segment created: {segment_file.name} ({segment_size} bytes)")
+
+            # Clean up temp file
+            temp_video.unlink()
+
+            self.segment_files.append(segment_file.name)
+            self.current_segment += 1
+            self.frame_buffer = []
+
+        except Exception as e:
+            print(f"[HLS {self.session_id}] Exception in _write_segment: {e}")
+            import traceback
+            traceback.print_exc()
+            # Clean up on error
+            if temp_video.exists():
+                temp_video.unlink()
+
+    def _update_playlist(self):
+        """Update the HLS playlist with current segments"""
+        playlist_path = self.output_dir / "playlist.m3u8"
+
+        # Calculate target duration (max segment duration)
+        target_duration = self.segment_duration + 1
+
+        with open(playlist_path, "w") as f:
+            f.write("#EXTM3U\n")
+            f.write("#EXT-X-VERSION:3\n")
+            f.write(f"#EXT-X-TARGETDURATION:{target_duration}\n")
+            f.write("#EXT-X-MEDIA-SEQUENCE:0\n")
+
+            # Add all segments
+            for segment in self.segment_files:
+                f.write(f"#EXTINF:{self.segment_duration:.3f},\n")
+                f.write(f"{segment}\n")
+
+            # Add END tag only if generation is complete
+            if self.is_complete:
+                f.write("#EXT-X-ENDLIST\n")
+
+    def finalize(self, audio_path: Optional[str] = None):
+        """Finalize the HLS stream - write remaining frames and mark complete"""
+        print(f"[HLS {self.session_id}] Finalizing HLS stream...")
+        
+        # Write any remaining frames
+        if self.frame_buffer:
+            print(f"[HLS {self.session_id}] Writing final segment with {len(self.frame_buffer)} remaining frames")
+            self._write_segment()
+
+        # Mark as complete and update playlist
+        self.is_complete = True
+        self._update_playlist()
+        
+        print(f"[HLS {self.session_id}] ✓ HLS stream finalized with {len(self.segment_files)} segments")
+        print(f"[HLS {self.session_id}] Total frames generated: {self.total_frames}")
+
+
+def convert_video_to_hls(
+    video_path: str, output_dir: Path, segment_duration: int = 2
+) -> str:
     """
-    Create a fragmented MP4 chunk from frames and corresponding audio segment.
-    
+    Convert MP4 video to HLS format with .m3u8 playlist and .ts segments
+
     Args:
-        frames: List of numpy arrays (H, W, C) in BGR format
-        audio_path: Path to full audio file (can be None for video-only)
-        start_frame: Starting frame number (for audio sync)
-        fps: Frames per second
-        temp_dir: Temporary directory for intermediate files
-        
+        video_path: Path to input MP4 video
+        output_dir: Directory to store HLS files
+        segment_duration: Duration of each segment in seconds
+
     Returns:
-        bytes of the fMP4 chunk
+        Path to the .m3u8 playlist file
     """
-    if not frames:
-        return b''
-    
-    chunk_id = uuid.uuid4().hex[:8]
-    temp_video = os.path.join(temp_dir, f"chunk_{chunk_id}_video.mp4")
-    temp_audio = os.path.join(temp_dir, f"chunk_{chunk_id}_audio.wav")
-    temp_output = os.path.join(temp_dir, f"chunk_{chunk_id}_output.mp4")
-    
+    playlist_name = "playlist.m3u8"
+    playlist_path = output_dir / playlist_name
+
+    # FFmpeg command to convert to HLS
+    cmd = [
+        "ffmpeg",
+        "-i",
+        video_path,
+        "-codec:",
+        "copy",
+        "-start_number",
+        "0",
+        "-hls_time",
+        str(segment_duration),
+        "-hls_list_size",
+        "0",
+        "-hls_segment_filename",
+        str(output_dir / "segment%03d.ts"),
+        "-f",
+        "hls",
+        str(playlist_path),
+        "-y",
+    ]
+
     try:
-        # Calculate timing
-        num_frames = len(frames)
-        start_time = start_frame / fps
-        duration = num_frames / fps
-        
-        # Write frames to temporary video file
-        h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
-        
-        for frame in frames:
-            writer.write(frame)
-        writer.release()
-        
-        # Check if we have audio to include
-        has_audio = audio_path is not None and os.path.exists(audio_path)
-        
-        if has_audio:
-            # Extract corresponding audio segment
-            extract_audio_cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', audio_path,
-                '-ss', str(start_time),
-                '-t', str(duration),
-                '-acodec', 'pcm_s16le',
-                '-ar', '16000',
-                '-ac', '1',
-                temp_audio
-            ]
-            result = subprocess.run(extract_audio_cmd, capture_output=True)
-            has_audio = result.returncode == 0 and os.path.exists(temp_audio)
-        
-        if has_audio:
-            # Create fragmented MP4 with video + audio
-            mux_cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', temp_video,
-                '-i', temp_audio,
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-profile:v', 'baseline',
-                '-level', '3.0',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-                '-f', 'mp4',
-                temp_output
-            ]
-        else:
-            # Create fragmented MP4 with video only
-            mux_cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', temp_video,
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-profile:v', 'baseline',
-                '-level', '3.0',
-                '-pix_fmt', 'yuv420p',
-                '-an',  # No audio
-                '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-                '-f', 'mp4',
-                temp_output
-            ]
-        
-        subprocess.run(mux_cmd, check=True, capture_output=True)
-        
-        # Read the output
-        with open(temp_output, 'rb') as f:
-            chunk_data = f.read()
-        
-        return chunk_data
-        
+        subprocess.run(cmd, check=True, capture_output=True)
+        return str(playlist_path)
     except subprocess.CalledProcessError as e:
-        print(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
-        return b''
-    except Exception as e:
-        print(f"Error creating fMP4 chunk: {e}")
-        return b''
-    finally:
-        # Cleanup temp files
-        for f in [temp_video, temp_audio, temp_output]:
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except:
-                    pass
+        raise Exception(f"FFmpeg conversion failed: {e.stderr.decode()}")
 
 
-def create_hls_stream(frames: list, audio_path: str, fps: float = 25.0, hls_time: int = 4, temp_dir: str = "/tmp") -> tuple:
-    """
-    Create HLS stream (.m3u8 playlist + .ts segments) from frames and audio.
-    
-    Args:
-        frames: List of numpy arrays (H, W, C) in BGR format
-        audio_path: Path to audio file (can be None for video-only)
-        fps: Frames per second
-        hls_time: Duration of each HLS segment in seconds (default: 4)
-        temp_dir: Temporary directory for output files
-        
-    Returns:
-        Tuple of (hls_dir, playlist_path) where:
-            - hls_dir: Directory containing all HLS files
-            - playlist_path: Path to .m3u8 playlist file
-    """
-    if not frames:
-        return None, None
-    
-    # Create unique HLS output directory
-    hls_id = uuid.uuid4().hex[:8]
-    hls_dir = os.path.join(temp_dir, f"hls_{hls_id}")
-    os.makedirs(hls_dir, exist_ok=True)
-    
-    temp_video = os.path.join(hls_dir, "input_video.mp4")
-    playlist_path = os.path.join(hls_dir, "stream.m3u8")
-    
-    try:
-        # Write frames to temporary video file
-        h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
-        
-        for frame in frames:
-            writer.write(frame)
-        writer.release()
-        
-        # Check if we have audio
-        has_audio = audio_path is not None and os.path.exists(audio_path)
-        
-        if has_audio:
-            # Create HLS with video + audio
-            hls_cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', temp_video,
-                '-i', audio_path,
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-profile:v', 'baseline',
-                '-level', '3.0',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-f', 'hls',
-                '-hls_time', str(hls_time),
-                '-hls_list_size', '0',  # Keep all segments in playlist
-                '-hls_segment_filename', os.path.join(hls_dir, 'segment_%03d.ts'),
-                playlist_path
-            ]
-        else:
-            # Create HLS with video only
-            hls_cmd = [
-                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                '-i', temp_video,
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-tune', 'zerolatency',
-                '-profile:v', 'baseline',
-                '-level', '3.0',
-                '-pix_fmt', 'yuv420p',
-                '-an',
-                '-f', 'hls',
-                '-hls_time', str(hls_time),
-                '-hls_list_size', '0',
-                '-hls_segment_filename', os.path.join(hls_dir, 'segment_%03d.ts'),
-                playlist_path
-            ]
-        
-        subprocess.run(hls_cmd, check=True, capture_output=True)
-        
-        # Clean up temp input video
-        if os.path.exists(temp_video):
-            os.remove(temp_video)
-        
-        return hls_dir, playlist_path
-        
-    except subprocess.CalledProcessError as e:
-        print(f"FFmpeg HLS error: {e.stderr.decode() if e.stderr else str(e)}")
-        return None, None
-    except Exception as e:
-        print(f"Error creating HLS stream: {e}")
-        return None, None
-
-
-@app.post("/api/v1/audio-driven/stream")
+@app.post("/api/audio-driven/stream")
 async def audio_driven_inference_stream(
+    background_tasks: BackgroundTasks,
     image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
     audio: UploadFile = File(..., description="Driving audio file (WAV, MP3)"),
     crop: bool = Form(True, description="Auto crop face from image"),
@@ -323,16 +772,14 @@ async def audio_driven_inference_stream(
     nfe: int = Form(10, description="Number of function evaluations (steps), range: 5-50"),
     cfg_scale: float = Form(2.0, description="Classifier-free guidance scale, range: 1.0-5.0"),
     format: str = Form("fmp4", description="Stream format: 'fmp4' (with audio), 'hls' (HLS playlist), 'mjpeg' (video only), or 'raw'"),
-    chunk_duration: float = Form(6.4, description="Chunk/segment duration in seconds (1.0-10.0, default: 6.4 = 160 frames)")
+    segment_duration: float = Form(6.4, description="Chunk/segment duration in seconds (1.0-10.0, default: 6.4 = 160 frames)"),
+    fps: float = Form(25.0, description="Frames per second for output video"),
+    pose_style: Optional[str] = Form(None, description="Optional pose style as JSON array [pitch, yaw, roll]"),
+    gaze_style: Optional[str] = Form(None, description="Optional gaze style as JSON array [x, y]"),
 ):
     """
-    Stream talking face video with audio in various formats.
-    
-    Supported Formats:
-        - 'fmp4': Fragmented MP4 chunks streamed in real-time (video + audio)
-        - 'hls': HLS playlist with .ts segments (video + audio) - returns JSON with base64 segments
-        - 'mjpeg': Motion JPEG stream (video only, no audio)
-        - 'raw': Raw length-prefixed JPEG frames
+    Generate talking face video from image and audio with progressive HLS streaming
+    Returns immediately with HLS URL - video starts streaming as soon as first segments are ready
     
     Args:
         image: Source image containing a face
@@ -342,463 +789,183 @@ async def audio_driven_inference_stream(
         nfe: Number of sampling steps (higher = better quality but slower)
         cfg_scale: Guidance scale for generation quality
         format: Output format ('fmp4', 'hls', 'mjpeg', 'raw')
-        chunk_duration: Duration of each chunk/segment in seconds (default: 2.0)
-        
-    Returns:
-        - fmp4: StreamingResponse with video/mp4 chunks
-        - hls: JSONResponse with playlist and base64-encoded .ts segments
-        - mjpeg: StreamingResponse with multipart JPEG frames
-        - raw: StreamingResponse with length-prefixed JPEG data
+        segment_duration: Duration of each segment in seconds
+
     """
-    print(f"Received streaming audio-driven inference request: crop={crop}, seed={seed}, nfe={nfe}, cfg_scale={cfg_scale}, format={format}, chunk_duration={chunk_duration}")
+    print(f"Received streaming audio-driven inference request: crop={crop}, seed={seed}, nfe={nfe}, cfg_scale={cfg_scale}, format={format}, segment_duration={segment_duration}")
     
     if agent is None:
         raise HTTPException(status_code=503, detail="Models not loaded properly")
-    
-    # Validate parameters
-    if nfe < 5 or nfe > 50:
-        raise HTTPException(status_code=400, detail="nfe must be between 5 and 50")
-    if cfg_scale < 1.0 or cfg_scale > 5.0:
-        raise HTTPException(status_code=400, detail="cfg_scale must be between 1.0 and 5.0")
-    if chunk_duration < 1.0 or chunk_duration > 10.0:
-        chunk_duration = 3.0  # Default to 3 seconds
-    
-    fps = 25.0
-    frames_per_chunk = int(chunk_duration * fps)  # e.g., 3.0 * 25 = 75 frames
-    
-    temp_img_path = None
-    temp_audio_path = None
+
+    # Create unique session ID
+    session_id = str(uuid.uuid4())
+    session_dir = HLS_OUTPUT_DIR / session_id
+    session_dir.mkdir(exist_ok=True)
     
     try:
+        # Detect image extension - fallback to .png if not found
+        image_ext = os.path.splitext(image.filename)[1] if image.filename else ""
+        if not image_ext or image_ext.lower() not in ['.png', '.jpg', '.jpeg']:
+            image_ext = ".png"
+        
+        # Detect audio extension - fallback to .wav if not found
+        audio_ext = os.path.splitext(audio.filename)[1] if audio.filename else ""
+        if not audio_ext or audio_ext.lower() not in ['.wav', '.mp3', '.m4a']:
+            audio_ext = ".wav"
+        
+        print(f"[{session_id}] Detected extensions: image={image_ext}, audio={audio_ext}, image.filename={image.filename}, audio.filename={audio.filename}")
+        
         # Save uploaded image
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(image.filename)[1], delete=False) as tmp:
-            temp_img_path = tmp.name
+        with tempfile.NamedTemporaryFile(suffix=image_ext, delete=False) as tmp:
+            img_path = tmp.name
             shutil.copyfileobj(image.file, tmp)
         
         # Save uploaded audio
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(audio.filename)[1], delete=False) as tmp:
-            temp_audio_path = tmp.name
+        with tempfile.NamedTemporaryFile(suffix=audio_ext, delete=False) as tmp:
+            aud_path = tmp.name
             shutil.copyfileobj(audio.file, tmp)
         
+        print(f"[{session_id}] Saved files: img={img_path}, aud={aud_path}")
+        
         # Load and process image
-        img_pil = Image.open(temp_img_path).convert('RGB')
-        
-        def fmp4_chunk_generator():
-            """Generate fragmented MP4 chunks with video + audio."""
+        img_pil = Image.open(img_path).convert('RGB')
+
+        # Initialize progressive HLS generator FIRST (creates initial playlist)
+        # Pass audio path so segments can include audio
+        hls_generator = ProgressiveHLSGenerator(
+            session_id, fps=fps, segment_duration=segment_duration, audio_path=aud_path
+        )
+
+        # Verify playlist was created
+        playlist_path = session_dir / "playlist.m3u8"
+        if not playlist_path.exists():
+            raise Exception("Failed to create initial playlist")
+
+        # Store generation status
+        generation_status[session_id] = {
+            "status": "generating",
+            "progress": 0,
+            "total_frames": 0,
+        }
+
+        # Parse JSON styles
+        pose_arr = json.loads(pose_style) if pose_style else None
+        gaze_arr = json.loads(gaze_style) if gaze_style else None
+
+        def generate_video():
             try:
-                frame_stream = agent.run_audio_inference_streaming(
-                    img_pil, temp_audio_path, crop, seed, nfe, cfg_scale
+                print(f"[{session_id}] Starting background generation...")
+
+                # Load and process image inside background task
+                img_pil = Image.open(img_path).convert("RGB")
+                print(f"[{session_id}] Image loaded successfully")
+
+                # Run progressive inference
+                print(f"[{session_id}] Starting progressive inference...")
+                agent.run_audio_inference_progressive(
+                    img_pil,
+                    aud_path,
+                    crop,
+                    seed,
+                    nfe,
+                    cfg_scale,
+                    hls_generator,
+                    pose_style=pose_arr,
+                    gaze_style=gaze_arr,
                 )
-                
-                frame_buffer = []  # Store BGR numpy frames
-                total_frame_count = 0
-                chunk_start_frame = 0
-                
-                for frame_tensor in frame_stream:
-                    # Convert tensor (C, H, W) to numpy (H, W, C)
-                    frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-                    
-                    # Normalize from [-1, 1] or [0, 1] to [0, 255]
-                    if frame_np.min() < 0:
-                        frame_np = (frame_np + 1) / 2
-                    frame_np = np.clip(frame_np, 0, 1)
-                    frame_np = (frame_np * 255).astype(np.uint8)
-                    
-                    # Convert RGB to BGR for OpenCV
-                    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                    frame_buffer.append(frame_bgr)
-                    total_frame_count += 1
-                    
-                    # When we have enough frames, create and send fMP4 chunk
-                    if len(frame_buffer) >= frames_per_chunk:
-                        print(f"Creating fMP4 chunk: frames {chunk_start_frame}-{chunk_start_frame + len(frame_buffer) - 1}")
-                        
-                        chunk_data = create_fmp4_chunk(
-                            frames=frame_buffer,
-                            audio_path=temp_audio_path,
-                            start_frame=chunk_start_frame,
-                            fps=fps,
-                            temp_dir=tempfile.gettempdir()
-                        )
-                        
-                        if chunk_data:
-                            yield chunk_data
-                        
-                        chunk_start_frame += len(frame_buffer)
-                        frame_buffer = []
-                
-                # Send remaining frames as final chunk
-                if frame_buffer:
-                    print(f"Creating final fMP4 chunk: frames {chunk_start_frame}-{chunk_start_frame + len(frame_buffer) - 1}")
-                    
-                    chunk_data = create_fmp4_chunk(
-                        frames=frame_buffer,
-                        audio_path=temp_audio_path,
-                        start_frame=chunk_start_frame,
-                        fps=fps,
-                        temp_dir=tempfile.gettempdir()
-                    )
-                    
-                    if chunk_data:
-                        yield chunk_data
-                
-                print(f"Streaming complete: {total_frame_count} total frames")
-                        
-            finally:
-                # Clean up temp files
-                if temp_img_path and os.path.exists(temp_img_path):
-                    os.remove(temp_img_path)
-                if temp_audio_path and os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-        
-        def mjpeg_generator():
-            """Generate MJPEG stream (video only, no audio)."""
-            try:
-                frame_stream = agent.run_audio_inference_streaming(
-                    img_pil, temp_audio_path, crop, seed, nfe, cfg_scale
-                )
-                
-                frame_buffer = []
-                for frame_tensor in frame_stream:
-                    frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-                    if frame_np.min() < 0:
-                        frame_np = (frame_np + 1) / 2
-                    frame_np = np.clip(frame_np, 0, 1)
-                    frame_np = (frame_np * 255).astype(np.uint8)
-                    
-                    _, buffer = cv2.imencode('.jpg', cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
-                    frame_bytes = buffer.tobytes()
-                    frame_buffer.append(frame_bytes)
-                    
-                    # Batch frames together
-                    if len(frame_buffer) >= frames_per_chunk:
-                        batch_data = b''
-                        for frame in frame_buffer:
-                            batch_data += (b'--frame\r\n'
-                                         b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                        yield batch_data
-                        frame_buffer = []
-                
-                # Send remaining
-                if frame_buffer:
-                    batch_data = b''
-                    for frame in frame_buffer:
-                        batch_data += (b'--frame\r\n'
-                                     b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                    yield batch_data
-                        
-            finally:
-                if temp_img_path and os.path.exists(temp_img_path):
-                    os.remove(temp_img_path)
-                if temp_audio_path and os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-        
-        # Return streaming response based on format
-        if format == "fmp4":
-            return StreamingResponse(
-                fmp4_chunk_generator(),
-                media_type="video/mp4",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Transfer-Encoding": "chunked",
-                    "X-Generation-Params": f"crop={crop},seed={seed},nfe={nfe},cfg_scale={cfg_scale},chunk_duration={chunk_duration}"
-                }
-            )
-        elif format == "hls":
-            # Stream HLS segments progressively as frames are generated
-            def hls_segment_generator():
-                """Generate HLS segments progressively and stream them."""
-                try:
-                    frame_stream = agent.run_audio_inference_streaming(
-                        img_pil, temp_audio_path, crop, seed, nfe, cfg_scale
-                    )
-                    
-                    frame_buffer = []
-                    segment_index = 0
-                    total_frames = 0
-                    playlist_lines = [
-                        "#EXTM3U",
-                        "#EXT-X-VERSION:3",
-                        "#EXT-X-TARGETDURATION:" + str(int(chunk_duration) + 1),
-                        "#EXT-X-MEDIA-SEQUENCE:0"
-                    ]
-                    
-                    temp_hls_dir = os.path.join(tempfile.gettempdir(), f"hls_{uuid.uuid4().hex[:8]}")
-                    os.makedirs(temp_hls_dir, exist_ok=True)
-                    
-                    for frame_tensor in frame_stream:
-                        # Convert frame
-                        frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-                        if frame_np.min() < 0:
-                            frame_np = (frame_np + 1) / 2
-                        frame_np = np.clip(frame_np, 0, 1)
-                        frame_np = (frame_np * 255).astype(np.uint8)
-                        frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                        frame_buffer.append(frame_bgr)
-                        total_frames += 1
-                        
-                        # Create segment when buffer is full
-                        if len(frame_buffer) >= frames_per_chunk:
-                            segment_name = f"segment_{segment_index:03d}.ts"
-                            segment_path = os.path.join(temp_hls_dir, segment_name)
-                            
-                            # Create temporary video from frames
-                            temp_video = os.path.join(temp_hls_dir, f"temp_{segment_index}.mp4")
-                            h, w = frame_buffer[0].shape[:2]
-                            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                            writer = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
-                            for frame in frame_buffer:
-                                writer.write(frame)
-                            writer.release()
-                            
-                            # Calculate audio segment timing - use frames_per_chunk for consistent timing
-                            start_time = (segment_index * frames_per_chunk) / fps
-                            duration = len(frame_buffer) / fps
-                            
-                            # Extract audio segment
-                            temp_audio_seg = os.path.join(temp_hls_dir, f"audio_{segment_index}.wav")
-                            has_audio = temp_audio_path and os.path.exists(temp_audio_path)
-                            
-                            if has_audio:
-                                try:
-                                    result = subprocess.run([
-                                        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
-                                        '-i', temp_audio_path,
-                                        '-ss', str(start_time), '-t', str(duration),
-                                        '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                                        temp_audio_seg
-                                    ], capture_output=True, text=True)
-                                    
-                                    if result.returncode != 0:
-                                        print(f"Warning: Audio extraction failed for segment {segment_index}: {result.stderr}")
-                                        has_audio = False
-                                    elif not os.path.exists(temp_audio_seg) or os.path.getsize(temp_audio_seg) < 1000:
-                                        print(f"Warning: Audio segment {segment_index} is empty or too small")
-                                        has_audio = False
-                                except Exception as e:
-                                    print(f"Error extracting audio for segment {segment_index}: {e}")
-                                    has_audio = False
-                            
-                            # Create HLS segment (.ts file)
-                            if has_audio and os.path.exists(temp_audio_seg):
-                                ffmpeg_cmd = [
-                                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                                    '-i', temp_video, '-i', temp_audio_seg,
-                                    '-c:v', 'libx264', '-preset', 'ultrafast',
-                                    '-c:a', 'aac', '-b:a', '128k',
-                                    '-f', 'mpegts',
-                                    segment_path
-                                ]
-                            else:
-                                ffmpeg_cmd = [
-                                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                                    '-i', temp_video,
-                                    '-c:v', 'libx264', '-preset', 'ultrafast', '-an',
-                                    '-f', 'mpegts',
-                                    segment_path
-                                ]
-                            
-                            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-                            
-                            # Read segment and send as JSON
-                            with open(segment_path, 'rb') as f:
-                                segment_data = base64.b64encode(f.read()).decode('utf-8')
-                            
-                            # Add to playlist
-                            playlist_lines.append(f"#EXTINF:{duration:.3f},")
-                            playlist_lines.append(segment_name)
-                            
-                            # Create partial playlist (for progressive playback)
-                            partial_playlist = "\n".join(playlist_lines)
-                            
-                            # Yield segment with partial playlist
-                            import json
-                            yield json.dumps({
-                                "type": "segment",
-                                "index": segment_index,
-                                "name": segment_name,
-                                "duration": duration,
-                                "data": segment_data,
-                                "playlist": partial_playlist  # Include current playlist state
-                            }) + "\n"
-                            
-                            print(f"Streamed HLS segment {segment_index}: {len(frame_buffer)} frames")
-                            
-                            # Cleanup temp files for this segment
-                            for f in [temp_video, temp_audio_seg]:
-                                if os.path.exists(f):
-                                    os.remove(f)
-                            
-                            segment_index += 1
-                            frame_buffer = []
-                    
-                    # Process remaining frames
-                    if frame_buffer:
-                        segment_name = f"segment_{segment_index:03d}.ts"
-                        segment_path = os.path.join(temp_hls_dir, segment_name)
-                        
-                        temp_video = os.path.join(temp_hls_dir, f"temp_{segment_index}.mp4")
-                        h, w = frame_buffer[0].shape[:2]
-                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                        writer = cv2.VideoWriter(temp_video, fourcc, fps, (w, h))
-                        for frame in frame_buffer:
-                            writer.write(frame)
-                        writer.release()
-                        
-                        start_time = (segment_index * frames_per_chunk) / fps
-                        duration = len(frame_buffer) / fps
-                        
-                        temp_audio_seg = os.path.join(temp_hls_dir, f"audio_{segment_index}.wav")
-                        has_audio = temp_audio_path and os.path.exists(temp_audio_path)
-                        
-                        if has_audio:
-                            try:
-                                result = subprocess.run([
-                                    'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
-                                    '-i', temp_audio_path,
-                                    '-ss', str(start_time), '-t', str(duration),
-                                    '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                                    temp_audio_seg
-                                ], capture_output=True, text=True)
-                                
-                                if result.returncode != 0:
-                                    print(f"Warning: Audio extraction failed for final segment {segment_index}: {result.stderr}")
-                                    has_audio = False
-                                elif not os.path.exists(temp_audio_seg) or os.path.getsize(temp_audio_seg) < 1000:
-                                    print(f"Warning: Final audio segment {segment_index} is empty or too small")
-                                    has_audio = False
-                            except Exception as e:
-                                print(f"Error extracting audio for final segment {segment_index}: {e}")
-                                has_audio = False
-                        
-                        if has_audio and os.path.exists(temp_audio_seg):
-                            ffmpeg_cmd = [
-                                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                                '-i', temp_video, '-i', temp_audio_seg,
-                                '-c:v', 'libx264', '-preset', 'ultrafast',
-                                '-c:a', 'aac', '-b:a', '128k',
-                                '-f', 'mpegts', segment_path
-                            ]
-                        else:
-                            ffmpeg_cmd = [
-                                'ffmpeg', '-y', '-hide_banner', '-loglevel', 'error',
-                                '-i', temp_video,
-                                '-c:v', 'libx264', '-preset', 'ultrafast', '-an',
-                                '-f', 'mpegts', segment_path
-                            ]
-                        
-                        subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-                        
-                        with open(segment_path, 'rb') as f:
-                            segment_data = base64.b64encode(f.read()).decode('utf-8')
-                        
-                        playlist_lines.append(f"#EXTINF:{duration:.3f},")
-                        playlist_lines.append(segment_name)
-                        
-                        # Create partial playlist for this segment
-                        partial_playlist = "\n".join(playlist_lines)
-                        
-                        import json
-                        yield json.dumps({
-                            "type": "segment",
-                            "index": segment_index,
-                            "name": segment_name,
-                            "duration": duration,
-                            "data": segment_data,
-                            "playlist": partial_playlist  # Include current playlist state
-                        }) + "\n"
-                        
-                        for f in [temp_video, temp_audio_seg]:
-                            if os.path.exists(f):
-                                os.remove(f)
-                        
-                        segment_index += 1
-                    
-                    # Send final playlist
-                    playlist_lines.append("#EXT-X-ENDLIST")
-                    playlist_content = "\n".join(playlist_lines)
-                    
-                    import json
-                    yield json.dumps({
-                        "type": "playlist",
-                        "content": playlist_content,
-                        "total_segments": segment_index,
-                        "total_frames": total_frames
-                    }) + "\n"
-                    
-                    print(f"HLS streaming complete: {segment_index} segments, {total_frames} frames")
-                    
-                finally:
-                    # Cleanup
-                    if os.path.exists(temp_hls_dir):
-                        shutil.rmtree(temp_hls_dir)
-                    if temp_img_path and os.path.exists(temp_img_path):
-                        os.remove(temp_img_path)
-                    if temp_audio_path and os.path.exists(temp_audio_path):
-                        os.remove(temp_audio_path)
-            
-            return StreamingResponse(
-                hls_segment_generator(),
-                media_type="application/x-ndjson",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Content-Type": "hls-segments",
-                    "X-Generation-Params": f"crop={crop},seed={seed},nfe={nfe},cfg_scale={cfg_scale},segment_duration={chunk_duration}"
-                }
-            )
-        elif format == "mjpeg":
-            return StreamingResponse(
-                mjpeg_generator(),
-                media_type="multipart/x-mixed-replace; boundary=frame",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Generation-Params": f"crop={crop},seed={seed},nfe={nfe},cfg_scale={cfg_scale}"
-                }
-            )
-        else:
-            # Raw format - send length-prefixed JPEG frames
-            def raw_generator():
-                try:
-                    frame_stream = agent.run_audio_inference_streaming(
-                        img_pil, temp_audio_path, crop, seed, nfe, cfg_scale
-                    )
-                    for frame_tensor in frame_stream:
-                        frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-                        if frame_np.min() < 0:
-                            frame_np = (frame_np + 1) / 2
-                        frame_np = np.clip(frame_np, 0, 1)
-                        frame_np = (frame_np * 255).astype(np.uint8)
-                        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
-                        frame_bytes = buffer.tobytes()
-                        yield len(frame_bytes).to_bytes(4, 'big') + frame_bytes
-                finally:
-                    if temp_img_path and os.path.exists(temp_img_path):
-                        os.remove(temp_img_path)
-                    if temp_audio_path and os.path.exists(temp_audio_path):
-                        os.remove(temp_audio_path)
-            
-            return StreamingResponse(
-                raw_generator(),
-                media_type="application/octet-stream",
-                headers={
-                    "X-Generation-Params": f"crop={crop},seed={seed},nfe={nfe},cfg_scale={cfg_scale}"
-                }
-            )
-        
+                print(f"[{session_id}] Progressive inference completed")
+
+                # Update status
+                generation_status[session_id]["status"] = "complete"
+                generation_status[session_id]["progress"] = 100
+                print(f"[{session_id}] Generation complete!")
+
+                # Clean up temporary files
+                os.remove(img_path)
+                os.remove(aud_path)
+                print(f"[{session_id}] Cleanup complete")
+
+            except Exception as e:
+                generation_status[session_id]["status"] = "error"
+                generation_status[session_id]["error"] = str(e)
+                print(f"[{session_id}] Generation error: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+        # Start generation in background
+        background_tasks.add_task(generate_video)
+
+        # Return immediately with HLS URL
+        hls_url = f"/hls/{session_id}/playlist.m3u8"
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "hls_url": hls_url,
+            "message": "Video generation started. Stream will begin as soon as first segments are ready.",
+            "streaming": "progressive",
+        }
+
     except Exception as e:
         # Clean up on error
-        if temp_img_path and os.path.exists(temp_img_path):
-            os.remove(temp_img_path)
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
-        
-        print(f"Error during streaming audio-driven inference: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+        if session_dir.exists():
+            shutil.rmtree(session_dir)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/v1/audio-driven")
+@app.get("/api/hls/{session_id}/playlist.m3u8")
+async def get_playlist(session_id: str):
+    """
+    Get HLS playlist file for a session
+    """
+    playlist_path = HLS_OUTPUT_DIR / session_id / "playlist.m3u8"
+
+    if not playlist_path.exists():
+        raise HTTPException(status_code=404, detail="Playlist not found")
+
+    return FileResponse(
+        playlist_path,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/api/hls/{session_id}/segment{segment_num}.ts")
+async def get_segment(session_id: str, segment_num: str):
+    """
+    Get HLS video segment for a session
+    """
+    segment_path = HLS_OUTPUT_DIR / session_id / f"segment{segment_num}.ts"
+
+    if not segment_path.exists():
+        raise HTTPException(status_code=404, detail="Segment not found")
+
+    return FileResponse(
+        segment_path,
+        media_type="video/mp2t",
+        headers={"Cache-Control": "public, max-age=31536000"},
+    )
+
+
+@app.delete("/api/hls/session/{session_id}")
+async def delete_session(session_id: str):
+    """
+    Delete HLS files for a session to free up space
+    """
+    session_dir = HLS_OUTPUT_DIR / session_id
+
+    if not session_dir.exists():
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        shutil.rmtree(session_dir)
+        return {"status": "success", "message": f"Session {session_id} deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/audio-driven")
 async def audio_driven_inference(
     image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
     audio: UploadFile = File(..., description="Driving audio file (WAV, MP3)"),
@@ -901,258 +1068,7 @@ async def audio_driven_inference(
             os.remove(temp_audio_path)
 
 
-@app.post("/api/v1/video-driven/stream")
-async def video_driven_inference_stream(
-    image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
-    video: UploadFile = File(..., description="Driving video file (MP4, AVI)"),
-    crop: bool = Form(False, description="Auto crop face from both source and driving video"),
-    format: str = Form("fmp4", description="Stream format: 'fmp4' (with audio), 'mjpeg' (video only), or 'raw'"),
-    chunk_duration: float = Form(3.0, description="Chunk duration in seconds (1.0-10.0, default: 3.0)")
-):
-    """
-    Stream video with audio as fragmented MP4 chunks (motion transferred from driving video).
-    
-    Args:
-        image: Source image containing a face
-        video: Driving video with facial movements to transfer
-        crop: Whether to automatically crop and detect faces
-        format: 'fmp4' for fragmented MP4 with audio, 'mjpeg' for video only, 'raw' for raw frames
-        chunk_duration: Duration of each chunk in seconds (default: 3.0)
-        
-    Returns:
-        Stream of fragmented MP4 chunks (video + audio) or MJPEG frames
-    """
-    print(f"Received streaming video-driven inference request: crop={crop}, format={format}, chunk_duration={chunk_duration}")
-    
-    if agent is None:
-        raise HTTPException(status_code=503, detail="Models not loaded properly")
-    
-    # Validate parameters
-    if chunk_duration < 1.0 or chunk_duration > 10.0:
-        chunk_duration = 3.0  # Default to 3 seconds
-    
-    fps = 25.0
-    frames_per_chunk = int(chunk_duration * fps)
-    
-    temp_img_path = None
-    temp_video_path = None
-    temp_audio_path = None
-    
-    try:
-        # Save uploaded image
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(image.filename)[1], delete=False) as tmp:
-            temp_img_path = tmp.name
-            shutil.copyfileobj(image.file, tmp)
-        
-        # Save uploaded video
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(video.filename)[1], delete=False) as tmp:
-            temp_video_path = tmp.name
-            shutil.copyfileobj(video.file, tmp)
-        
-        # Extract audio from driving video for fMP4 streaming
-        temp_audio_path = None
-        if format == "fmp4":
-            temp_audio_path = tempfile.mktemp(suffix='.wav')
-            try:
-                subprocess.run([
-                    'ffmpeg', '-y', '-i', temp_video_path,
-                    '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                    temp_audio_path
-                ], check=True, capture_output=True)
-            except subprocess.CalledProcessError:
-                print("Warning: Could not extract audio from driving video, streaming video only")
-                temp_audio_path = None
-        
-        # Load and process image
-        img_pil = Image.open(temp_img_path).convert('RGB')
-        
-        def fmp4_chunk_generator():
-            """Generate fragmented MP4 chunks with video + audio from driving video."""
-            try:
-                frame_stream = agent.run_video_inference_streaming(
-                    img_pil, temp_video_path, crop
-                )
-                
-                frame_buffer = []
-                total_frame_count = 0
-                chunk_start_frame = 0
-                
-                for frame_tensor in frame_stream:
-                    frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-                    if frame_np.min() < 0:
-                        frame_np = (frame_np + 1) / 2
-                    frame_np = np.clip(frame_np, 0, 1)
-                    frame_np = (frame_np * 255).astype(np.uint8)
-                    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                    frame_buffer.append(frame_bgr)
-                    total_frame_count += 1
-                    
-                    if len(frame_buffer) >= frames_per_chunk:
-                        print(f"Creating fMP4 chunk: frames {chunk_start_frame}-{chunk_start_frame + len(frame_buffer) - 1}")
-                        
-                        if temp_audio_path and os.path.exists(temp_audio_path):
-                            chunk_data = create_fmp4_chunk(
-                                frames=frame_buffer,
-                                audio_path=temp_audio_path,
-                                start_frame=chunk_start_frame,
-                                fps=fps,
-                                temp_dir=tempfile.gettempdir()
-                            )
-                        else:
-                            # No audio - create video-only fMP4
-                            chunk_data = create_fmp4_chunk(
-                                frames=frame_buffer,
-                                audio_path=None,
-                                start_frame=chunk_start_frame,
-                                fps=fps,
-                                temp_dir=tempfile.gettempdir()
-                            )
-                        
-                        if chunk_data:
-                            yield chunk_data
-                        
-                        chunk_start_frame += len(frame_buffer)
-                        frame_buffer = []
-                
-                # Send remaining frames
-                if frame_buffer:
-                    print(f"Creating final fMP4 chunk: frames {chunk_start_frame}-{chunk_start_frame + len(frame_buffer) - 1}")
-                    
-                    if temp_audio_path and os.path.exists(temp_audio_path):
-                        chunk_data = create_fmp4_chunk(
-                            frames=frame_buffer,
-                            audio_path=temp_audio_path,
-                            start_frame=chunk_start_frame,
-                            fps=fps,
-                            temp_dir=tempfile.gettempdir()
-                        )
-                    else:
-                        chunk_data = create_fmp4_chunk(
-                            frames=frame_buffer,
-                            audio_path=None,
-                            start_frame=chunk_start_frame,
-                            fps=fps,
-                            temp_dir=tempfile.gettempdir()
-                        )
-                    
-                    if chunk_data:
-                        yield chunk_data
-                
-                print(f"Streaming complete: {total_frame_count} total frames")
-                        
-            finally:
-                if temp_img_path and os.path.exists(temp_img_path):
-                    os.remove(temp_img_path)
-                if temp_video_path and os.path.exists(temp_video_path):
-                    os.remove(temp_video_path)
-                if temp_audio_path and os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-        
-        def mjpeg_generator():
-            """Generate MJPEG stream (video only)."""
-            try:
-                frame_stream = agent.run_video_inference_streaming(
-                    img_pil, temp_video_path, crop
-                )
-                
-                frame_buffer = []
-                for frame_tensor in frame_stream:
-                    frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-                    if frame_np.min() < 0:
-                        frame_np = (frame_np + 1) / 2
-                    frame_np = np.clip(frame_np, 0, 1)
-                    frame_np = (frame_np * 255).astype(np.uint8)
-                    _, buffer = cv2.imencode('.jpg', cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
-                    frame_bytes = buffer.tobytes()
-                    frame_buffer.append(frame_bytes)
-                    
-                    if len(frame_buffer) >= frames_per_chunk:
-                        batch_data = b''
-                        for frame in frame_buffer:
-                            batch_data += (b'--frame\r\n'
-                                         b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                        yield batch_data
-                        frame_buffer = []
-                
-                if frame_buffer:
-                    batch_data = b''
-                    for frame in frame_buffer:
-                        batch_data += (b'--frame\r\n'
-                                     b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-                    yield batch_data
-                        
-            finally:
-                if temp_img_path and os.path.exists(temp_img_path):
-                    os.remove(temp_img_path)
-                if temp_video_path and os.path.exists(temp_video_path):
-                    os.remove(temp_video_path)
-        
-        # Return streaming response based on format
-        if format == "fmp4":
-            return StreamingResponse(
-                fmp4_chunk_generator(),
-                media_type="video/mp4",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Transfer-Encoding": "chunked",
-                    "X-Generation-Params": f"crop={crop},chunk_duration={chunk_duration}"
-                }
-            )
-        elif format == "mjpeg":
-            return StreamingResponse(
-                mjpeg_generator(),
-                media_type="multipart/x-mixed-replace; boundary=frame",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Generation-Params": f"crop={crop}"
-                }
-            )
-        else:
-            # Raw format
-            def raw_generator():
-                try:
-                    frame_stream = agent.run_video_inference_streaming(
-                        img_pil, temp_video_path, crop
-                    )
-                    for frame_tensor in frame_stream:
-                        frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-                        if frame_np.min() < 0:
-                            frame_np = (frame_np + 1) / 2
-                        frame_np = np.clip(frame_np, 0, 1)
-                        frame_np = (frame_np * 255).astype(np.uint8)
-                        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR))
-                        frame_bytes = buffer.tobytes()
-                        yield len(frame_bytes).to_bytes(4, 'big') + frame_bytes
-                finally:
-                    if temp_img_path and os.path.exists(temp_img_path):
-                        os.remove(temp_img_path)
-                    if temp_video_path and os.path.exists(temp_video_path):
-                        os.remove(temp_video_path)
-            
-            return StreamingResponse(
-                raw_generator(),
-                media_type="application/octet-stream",
-                headers={
-                    "X-Generation-Params": f"crop={crop}"
-                }
-            )
-        
-    except Exception as e:
-        # Clean up on error
-        if temp_img_path and os.path.exists(temp_img_path):
-            os.remove(temp_img_path)
-        if temp_video_path and os.path.exists(temp_video_path):
-            os.remove(temp_video_path)
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
-        
-        print(f"Error during streaming video-driven inference: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
-
-
-@app.post("/api/v1/video-driven")
+@app.post("/api/video-driven")
 async def video_driven_inference(
     image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
     video: UploadFile = File(..., description="Driving video file (MP4, AVI)"),
@@ -1233,7 +1149,7 @@ async def video_driven_inference(
             os.remove(temp_video_path)
 
 
-@app.get("/api/v1/outputs/{filename}")
+@app.get("/api/outputs/{filename}")
 async def get_output(filename: str):
     """
     Retrieve a previously generated output video.
@@ -1256,7 +1172,7 @@ async def get_output(filename: str):
     )
 
 
-@app.delete("/api/v1/outputs/{filename}")
+@app.delete("/api/outputs/{filename}")
 async def delete_output(filename: str):
     """
     Delete a previously generated output video.
@@ -1279,7 +1195,7 @@ async def delete_output(filename: str):
         raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
 
 
-@app.get("/api/v1/outputs")
+@app.get("/api/outputs")
 async def list_outputs():
     """
     List all generated output videos.
