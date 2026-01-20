@@ -28,6 +28,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import shutil
+import asyncio
+import threading
 from pathlib import Path
 import uuid
 import asyncio
@@ -76,10 +78,6 @@ output_dir = "./outputs"
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, List
-import time
-
-
-
 
 class InferenceAgent:
     def __init__(self, opt):
@@ -291,6 +289,7 @@ class InferenceAgent:
         hls_generator: "ProgressiveHLSGenerator",
         pose_style=None,
         gaze_style=None,
+        is_final_chunk=False,
     ):
         """Run audio inference with progressive HLS generation"""
         # Clear memory before starting
@@ -375,8 +374,8 @@ class InferenceAgent:
             if t % 10 == 0 and self.device == "mps":
                 torch.mps.empty_cache()
 
-        # Finalize HLS stream with audio
-        hls_generator.finalize(audio_path=aud_path)
+        # Finalize HLS stream - mark complete only if this is the final chunk
+        hls_generator.finalize(audio_path=aud_path, mark_complete=is_final_chunk)
 
         # Final cleanup
         if self.device == "mps":
@@ -532,6 +531,40 @@ app.mount("/hls", StaticFiles(directory=str(HLS_OUTPUT_DIR)), name="hls")
 generation_status = {}
 
 
+def cleanup_hls_session(session_id: str, delay_minutes: int = 5):
+    """
+    Schedule cleanup of HLS output directory after a delay
+    
+    Args:
+        session_id: The session ID to clean up
+        delay_minutes: Minutes to wait before cleanup (default 5)
+    """
+    def _cleanup():
+        import time
+        delay_seconds = delay_minutes * 60
+        print(f"[CLEANUP] Scheduled cleanup for session {session_id} in {delay_minutes} minutes")
+        time.sleep(delay_seconds)
+        
+        session_dir = HLS_OUTPUT_DIR / session_id
+        if session_dir.exists():
+            try:
+                shutil.rmtree(session_dir)
+                print(f"[CLEANUP] ✓ Deleted HLS output for session {session_id}")
+                
+                # Also remove from generation_status
+                if session_id in generation_status:
+                    del generation_status[session_id]
+                    print(f"[CLEANUP] ✓ Removed session {session_id} from status tracking")
+            except Exception as e:
+                print(f"[CLEANUP] ERROR: Failed to delete session {session_id}: {e}")
+        else:
+            print(f"[CLEANUP] Session {session_id} directory already deleted")
+    
+    # Start cleanup in background thread
+    cleanup_thread = threading.Thread(target=_cleanup, daemon=True)
+    cleanup_thread.start()
+
+
 class ProgressiveHLSGenerator:
     """Generate HLS segments progressively as frames are created"""
 
@@ -539,7 +572,7 @@ class ProgressiveHLSGenerator:
         self,
         session_id: str,
         fps: float = 25.0,
-        segment_duration: int = 4,
+        segment_duration: int =2,
         audio_path: Optional[str] = None,
     ):
         self.session_id = session_id
@@ -560,8 +593,17 @@ class ProgressiveHLSGenerator:
         print(f"[HLS {self.session_id}] Output directory: {self.output_dir}")
         print(f"[HLS {self.session_id}] Audio path: {self.audio_path}")
 
-        # Create initial empty playlist so HLS player can start loading
-        self._create_initial_playlist()
+        # Check if session already exists and load existing segments
+        self._load_existing_session()
+        
+        # Update playlist with existing segments (if any) to ensure continuity
+        # This prevents the playlist from starting empty when resuming
+        if self.segment_files:
+            print(f"[HLS {self.session_id}] Updating playlist with {len(self.segment_files)} existing segments")
+            self._update_playlist()
+        else:
+            # Create initial empty playlist only for new sessions
+            self._create_initial_playlist()
 
     def add_frame(self, frame: np.ndarray):
         """Add a frame to the buffer and create segment if buffer is full"""
@@ -576,6 +618,44 @@ class ProgressiveHLSGenerator:
             self._write_segment()
             self._update_playlist()
 
+    def _load_existing_session(self):
+        """Load existing segments if session already exists"""
+        import glob
+
+        # Small delay + sync to ensure file system has caught up with recent writes from previous chunk
+        time.sleep(0.05)
+        try:
+            os.sync()
+            print(f"[HLS {self.session_id}] Filesystem synced")
+        except:
+            print(f"[HLS {self.session_id}] os.sync() not available")
+        
+        # Find existing segment files
+        search_pattern = str(self.output_dir / "segment*.ts")
+        existing_segments = sorted(glob.glob(search_pattern))
+        
+        
+        if existing_segments:
+            for seg_path in existing_segments:
+                print(f"[HLS {self.session_id}]   - {seg_path}")
+            
+            # Clear any existing entries (safety)
+            self.segment_files = []
+            
+            # Extract segment numbers and file names
+            for seg_path in existing_segments:
+                seg_name = os.path.basename(seg_path)
+                self.segment_files.append(seg_name)
+                
+                # Extract segment number from filename (e.g., "segment003.ts" -> 3)
+                import re
+                match = re.search(r'segment(\d+)\.ts', seg_name)
+                if match:
+                    seg_num = int(match.group(1))
+                    if seg_num >= self.current_segment:
+                        self.current_segment = seg_num + 1
+        
+
     def _create_initial_playlist(self):
         """Create an initial empty playlist for HLS player to start loading"""
         playlist_path = self.output_dir / "playlist.m3u8"
@@ -585,6 +665,7 @@ class ProgressiveHLSGenerator:
             f.write("#EXTM3U\n")
             f.write("#EXT-X-VERSION:3\n")
             f.write(f"#EXT-X-TARGETDURATION:{target_duration}\n")
+            f.write("#EXT-X-PLAYLIST-TYPE:EVENT\n")
             f.write("#EXT-X-MEDIA-SEQUENCE:0\n")
             # No segments yet, player will poll for updates
 
@@ -595,10 +676,27 @@ class ProgressiveHLSGenerator:
             return
 
         segment_file = self.output_dir / f"segment{self.current_segment:03d}.ts"
+        segment_name = f"segment{self.current_segment:03d}.ts"
         temp_video = self.output_dir / f"temp_segment{self.current_segment:03d}.mp4"
 
-        print(f"[HLS {self.session_id}] Writing segment {self.current_segment} with {len(self.frame_buffer)} frames")
+        # CRITICAL FIX: Check if segment already exists (prevent overwriting from concurrent chunks)
+        if segment_file.exists():
+            # Find all actual segments on disk
+            import glob
+            all_segments = sorted(glob.glob(str(self.output_dir / "segment*.ts")))
 
+            import re
+            max_seg = -1
+            for seg_path in all_segments:
+                match = re.search(r'segment(\d+)\.ts', os.path.basename(seg_path))
+                if match:
+                    max_seg = max(max_seg, int(match.group(1)))
+            self.current_segment = max_seg + 1
+            segment_file = self.output_dir / f"segment{self.current_segment:03d}.ts"
+            segment_name = f"segment{self.current_segment:03d}.ts"
+            temp_video = self.output_dir / f"temp_segment{self.current_segment:03d}.mp4"
+            # Also reload all segments into our list
+            self.segment_files = [os.path.basename(s) for s in all_segments]
         try:
             # Write frames to temporary MP4
             height, width = self.frame_buffer[0].shape[:2]
@@ -689,31 +787,44 @@ class ProgressiveHLSGenerator:
             f.write("#EXTM3U\n")
             f.write("#EXT-X-VERSION:3\n")
             f.write(f"#EXT-X-TARGETDURATION:{target_duration}\n")
+            f.write("#EXT-X-PLAYLIST-TYPE:EVENT\n")
             f.write("#EXT-X-MEDIA-SEQUENCE:0\n")
 
             # Add all segments
-            for segment in self.segment_files:
+            for idx, segment in enumerate(self.segment_files):
                 f.write(f"#EXTINF:{self.segment_duration:.3f},\n")
                 f.write(f"{segment}\n")
+                print(f"[HLS {self.session_id}]   [{idx}] {segment}")
 
             # Add END tag only if generation is complete
             if self.is_complete:
                 f.write("#EXT-X-ENDLIST\n")
+                print(f"[HLS {self.session_id}] ✓✓✓ Added #EXT-X-ENDLIST tag ✓✓✓")
+            else:
+                print(f"[HLS {self.session_id}] No ENDLIST (stream open for more chunks)")
+            
+            # Flush to disk immediately
+            f.flush()
+            os.fsync(f.fileno())
+        
+        print(f"[HLS {self.session_id}] ========== PLAYLIST UPDATED ==========\n")
 
-    def finalize(self, audio_path: Optional[str] = None):
-        """Finalize the HLS stream - write remaining frames and mark complete"""
-        print(f"[HLS {self.session_id}] Finalizing HLS stream...")
+    def finalize(self, audio_path: Optional[str] = None, mark_complete: bool = False):
         
         # Write any remaining frames
         if self.frame_buffer:
             print(f"[HLS {self.session_id}] Writing final segment with {len(self.frame_buffer)} remaining frames")
             self._write_segment()
 
-        # Mark as complete and update playlist
-        self.is_complete = True
-        self._update_playlist()
+        # Only mark as complete if explicitly requested (when no more chunks are coming)
+        if mark_complete:
+            self.is_complete = True
+            print(f"[HLS {self.session_id}] Stream marked as COMPLETE")
+            
+            # Schedule cleanup after 5 minutes
+            cleanup_hls_session(self.session_id, delay_minutes=5)
         
-        print(f"[HLS {self.session_id}] ✓ HLS stream finalized with {len(self.segment_files)} segments")
+        self._update_playlist()
         print(f"[HLS {self.session_id}] Total frames generated: {self.total_frames}")
 
 
@@ -765,6 +876,7 @@ def convert_video_to_hls(
 @app.post("/api/audio-driven/stream")
 async def audio_driven_inference_stream(
     background_tasks: BackgroundTasks,
+    unique_id: str = Form(..., description="Unique session ID"),
     image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
     audio: UploadFile = File(..., description="Driving audio file (WAV, MP3)"),
     crop: bool = Form(True, description="Auto crop face from image"),
@@ -772,10 +884,11 @@ async def audio_driven_inference_stream(
     nfe: int = Form(10, description="Number of function evaluations (steps), range: 5-50"),
     cfg_scale: float = Form(2.0, description="Classifier-free guidance scale, range: 1.0-5.0"),
     format: str = Form("fmp4", description="Stream format: 'fmp4' (with audio), 'hls' (HLS playlist), 'mjpeg' (video only), or 'raw'"),
-    segment_duration: float = Form(6.4, description="Chunk/segment duration in seconds (1.0-10.0, default: 6.4 = 160 frames)"),
+    segment_duration: float = Form(2, description="Chunk/segment duration in seconds (1.0-10.0, default: 6.4 = 160 frames)"),
     fps: float = Form(25.0, description="Frames per second for output video"),
     pose_style: Optional[str] = Form(None, description="Optional pose style as JSON array [pitch, yaw, roll]"),
     gaze_style: Optional[str] = Form(None, description="Optional gaze style as JSON array [x, y]"),
+    is_final_chunk: bool = Form(False, description="Set to True for the last chunk to finalize the HLS stream"),
 ):
     """
     Generate talking face video from image and audio with progressive HLS streaming
@@ -792,14 +905,21 @@ async def audio_driven_inference_stream(
         segment_duration: Duration of each segment in seconds
 
     """
-    print(f"Received streaming audio-driven inference request: crop={crop}, seed={seed}, nfe={nfe}, cfg_scale={cfg_scale}, format={format}, segment_duration={segment_duration}")
-    
     if agent is None:
         raise HTTPException(status_code=503, detail="Models not loaded properly")
 
     # Create unique session ID
-    session_id = str(uuid.uuid4())
+    session_id = unique_id or str(uuid.uuid4())
     session_dir = HLS_OUTPUT_DIR / session_id
+    
+    # Check if session already exists
+    session_exists = session_dir.exists()
+    if session_exists:
+        # Check if there's already an HLS playlist
+        playlist_path = session_dir / "playlist.m3u8"
+    else:
+        print(f"[{session_id}] New session, creating directory")
+    
     session_dir.mkdir(exist_ok=True)
     
     try:
@@ -861,7 +981,7 @@ async def audio_driven_inference_stream(
                 print(f"[{session_id}] Image loaded successfully")
 
                 # Run progressive inference
-                print(f"[{session_id}] Starting progressive inference...")
+                print(f"[{session_id}] Starting progressive inference with is_final_chunk={is_final_chunk}...")
                 agent.run_audio_inference_progressive(
                     img_pil,
                     aud_path,
@@ -872,13 +992,13 @@ async def audio_driven_inference_stream(
                     hls_generator,
                     pose_style=pose_arr,
                     gaze_style=gaze_arr,
+                    is_final_chunk=is_final_chunk,
                 )
                 print(f"[{session_id}] Progressive inference completed")
 
                 # Update status
                 generation_status[session_id]["status"] = "complete"
                 generation_status[session_id]["progress"] = 100
-                print(f"[{session_id}] Generation complete!")
 
                 # Clean up temporary files
                 os.remove(img_path)
