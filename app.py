@@ -111,6 +111,12 @@ class AppConfig:
         self.a_cfg_scale = 3.0
         self.swin_res_threshold = 128
         self.window_size = 8
+        
+        # Parallel rendering configuration (for fastapi_app.py)
+        # Auto-configure based on device and available VRAM
+        self.num_render_workers = self._get_optimal_workers()
+        self.render_chunk_size = self._get_optimal_chunk_size()
+        
         self.ref_path = None
         self.pose_path = None
         self.gaze_path = None
@@ -118,6 +124,43 @@ class AppConfig:
         self.crop = True
         self.source_path = None
         self.driving_path = None
+    
+    def _get_optimal_workers(self):
+        """Auto-detect optimal number of parallel rendering workers"""
+        if torch.cuda.is_available():
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if vram_gb > 16:
+                    return 4  # High VRAM
+                elif vram_gb > 8:
+                    return 3  # Medium VRAM (recommended)
+                else:
+                    return 2  # Low VRAM
+            except:
+                return 3  # Default
+        elif torch.backends.mps.is_available():
+            return 2  # MPS has memory constraints
+        else:
+            import os
+            return max(1, os.cpu_count() // 2 if os.cpu_count() else 2)  # CPU
+    
+    def _get_optimal_chunk_size(self):
+        """Auto-detect optimal chunk size for parallel rendering"""
+        if torch.cuda.is_available():
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                if vram_gb > 16:
+                    return 10  # Large chunks for high VRAM
+                elif vram_gb > 8:
+                    return 5   # Medium chunks (recommended)
+                else:
+                    return 3   # Small chunks for low VRAM
+            except:
+                return 5  # Default
+        elif torch.backends.mps.is_available():
+            return 3  # Small chunks for MPS
+        else:
+            return 10  # Larger chunks for CPU (less overhead)
 
 class DataProcessor:
     def __init__(self, opt):
