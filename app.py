@@ -122,6 +122,7 @@ class AppConfig:
         self.gaze_path = None
         self.aud_path = None
         self.crop = True
+        self.crop_scale = 0.8  # Face crop padding scale (0.5=tight, 0.8=default, 1.2=loose)
         self.source_path = None
         self.driving_path = None
     
@@ -167,6 +168,8 @@ class DataProcessor:
         self.opt = opt
         self.fps = opt.fps
         self.sampling_rate = opt.sampling_rate
+        # Crop scale: controls how much padding around the face (0.5=tight, 0.8=default, 1.2=loose)
+        self.crop_scale = getattr(opt, 'crop_scale', 0.8)
         print(f"Loading Face Alignment...")
         # Load FaceAlignment on CPU to save VRAM for the generator
         self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, device='cpu', flip_input=False)
@@ -210,7 +213,7 @@ class DataProcessor:
             cy = (y1 + y2) // 2
             w_face = x2 - x1
             h_face = y2 - y1
-            half_side = int(max(w_face, h_face) * 0.8)
+            half_side = int(max(w_face, h_face) * self.crop_scale)
             x1_new = cx - half_side
             y1_new = cy - half_side
             x2_new = cx + half_side

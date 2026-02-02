@@ -22,6 +22,8 @@ class DataProcessor:
     def __init__(self, opt):
         self.opt = opt
         self.input_size = opt.input_size
+        # Crop scale: controls how much padding around the face (1.0=tight, 2.0=loose)
+        self.crop_scale = getattr(opt, 'crop_scale', 1.6)
         self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
         
         self.transform = transforms.Compose([
@@ -61,7 +63,7 @@ class DataProcessor:
         x1, y1, x2, y2, _ = valid_bboxes[0]
         bsy, bsx = int((y2 - y1) / 2), int((x2 - x1) / 2)
         my, mx = int((y1 + y2) / 2), int((x1 + x2) / 2)
-        bs = int(max(bsy, bsx) * 1.6)
+        bs = int(max(bsy, bsx) * self.crop_scale)
     
         # Pad image to allow cropping outside boundaries
         img = cv2.copyMakeBorder(img, bs, bs, bs, bs, cv2.BORDER_CONSTANT, value=0)
@@ -215,6 +217,7 @@ if __name__ == '__main__':
     # Options
     parser.add_argument("--fps", type=int, default=None, help="Output FPS (default: same as input)")
     parser.add_argument("--crop", action="store_true", help="Crop face from source image")
+    parser.add_argument("--crop_scale", type=float, default=1.6, help="Crop padding scale (1.0=tight, 1.6=default, 2.0=loose)")
 
     args = parser.parse_args()
 
