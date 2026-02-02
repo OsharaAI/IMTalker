@@ -5,6 +5,7 @@ Provides REST API endpoints for audio-driven and video-driven talking face gener
 
 import os
 import sys
+import io
 import tempfile
 import subprocess
 import numpy as np
@@ -532,6 +533,80 @@ async def health():
             "generator": os.path.exists(cfg.generator_path) if cfg else False,
         }
     }
+
+
+@app.post("/crop")
+async def crop_image(
+    file: UploadFile = File(..., description="Image file to crop"),
+    crop_scale: float = Form(0.8, description="Crop scale factor (0.5=tight, 0.8=default, 1.2=loose)", ge=0.3, le=2.0),
+    output_size: Optional[int] = Form(None, description="Output size in pixels (square)", ge=64, le=2048),
+    format: str = Form("jpeg", description="Output format (jpeg, png, webp)")
+):
+    """
+    Crop image centered on detected face with configurable padding.
+    
+    This endpoint uses face detection to intelligently crop images around detected faces.
+    If no face is detected, it falls back to center crop.
+    
+    Args:
+        file: Image file (JPEG, PNG, WebP)
+        crop_scale: Scale factor for crop padding (0.5=tight, 0.8=default, 1.2=loose)
+        output_size: Optional output size in pixels (square)
+        format: Output image format (jpeg, png, webp)
+        
+    Returns:
+        Cropped image file
+    """
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+    
+    # Validate format
+    format = format.lower()
+    if format not in ["jpeg", "jpg", "png", "webp"]:
+        raise HTTPException(status_code=400, detail="Invalid format. Use jpeg, png, or webp")
+    
+    try:
+        # Read image
+        contents = await file.read()
+        img = Image.open(io.BytesIO(contents)).convert('RGB')
+        
+        # Use the existing DataProcessor to crop the image
+        # Temporarily set crop_scale on the processor
+        original_crop_scale = agent.data_processor.crop_scale
+        agent.data_processor.crop_scale = crop_scale
+        
+        try:
+            # Process image (crop around face)
+            cropped_img = agent.data_processor.process_img(img)
+            
+            # Resize if output_size specified
+            if output_size:
+                cropped_img = cropped_img.resize((output_size, output_size), Image.LANCZOS)
+        finally:
+            # Restore original crop_scale
+            agent.data_processor.crop_scale = original_crop_scale
+        
+        # Convert to bytes
+        img_byte_arr = io.BytesIO()
+        if format in ["jpeg", "jpg"]:
+            cropped_img.save(img_byte_arr, format='JPEG', quality=95)
+            media_type = "image/jpeg"
+        elif format == "png":
+            cropped_img.save(img_byte_arr, format='PNG')
+            media_type = "image/png"
+        elif format == "webp":
+            cropped_img.save(img_byte_arr, format='WEBP', quality=95)
+            media_type = "image/webp"
+        
+        img_byte_arr.seek(0)
+        
+        return StreamingResponse(img_byte_arr, media_type=media_type)
+        
+    except Exception as e:
+        print(f"Crop error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Crop failed: {str(e)}")
 
 
 # Create directories for HLS output
