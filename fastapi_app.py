@@ -1235,6 +1235,7 @@ async def audio_driven_inference(
     image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
     audio: UploadFile = File(..., description="Driving audio file (WAV, MP3)"),
     crop: bool = Form(True, description="Auto crop face from image"),
+    crop_scale: float = Form(0.8, description="Crop padding scale (0.5=tight, 0.8=default, 1.2=loose)"),
     seed: int = Form(42, description="Random seed for generation"),
     nfe: int = Form(10, description="Number of function evaluations (steps), range: 5-50"),
     cfg_scale: float = Form(2.0, description="Classifier-free guidance scale, range: 1.0-5.0")
@@ -1287,8 +1288,12 @@ async def audio_driven_inference(
         # Load and process image
         img_pil = Image.open(temp_img_path).convert('RGB')
         
+        # Temporarily set crop_scale for this request
+        original_crop_scale = agent.data_processor.crop_scale
+        agent.data_processor.crop_scale = crop_scale
+        
         # Run inference
-        print(f"Running audio-driven inference: crop={crop}, seed={seed}, nfe={nfe}, cfg_scale={cfg_scale}")
+        print(f"Running audio-driven inference: crop={crop}, crop_scale={crop_scale}, seed={seed}, nfe={nfe}, cfg_scale={cfg_scale}")
         output_video_path = agent.run_audio_inference(
             img_pil, 
             temp_audio_path, 
@@ -1297,6 +1302,9 @@ async def audio_driven_inference(
             nfe, 
             cfg_scale
         )
+        
+        # Restore original crop_scale
+        agent.data_processor.crop_scale = original_crop_scale
         
         # Generate unique filename
         unique_id = str(uuid.uuid4())
