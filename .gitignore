@@ -74,3 +74,5 @@ logs/
 .env.local
 
 *.pyc
+generator/__pycache__/*
+renderer/__pycache__/*

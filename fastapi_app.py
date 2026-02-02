@@ -1011,6 +1011,7 @@ async def audio_driven_inference_stream(
     image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
     audio: UploadFile = File(..., description="Driving audio file (WAV, MP3)"),
     crop: bool = Form(True, description="Auto crop face from image"),
+    crop_scale: float = Form(0.8, description="Crop scale factor"),
     seed: int = Form(42, description="Random seed for generation"),
     nfe: int = Form(10, description="Number of function evaluations (steps), range: 5-50"),
     cfg_scale: float = Form(2.0, description="Classifier-free guidance scale, range: 1.0-5.0"),
@@ -1034,7 +1035,7 @@ async def audio_driven_inference_stream(
         cfg_scale: Guidance scale for generation quality
         format: Output format ('fmp4', 'hls', 'mjpeg', 'raw')
         segment_duration: Duration of each segment in seconds
-
+        crop_scale: Crop scale factor
     """
     if agent is None:
         raise HTTPException(status_code=503, detail="Models not loaded properly")
@@ -1121,6 +1122,10 @@ async def audio_driven_inference_stream(
                 img_pil = Image.open(img_path).convert("RGB")
                 print(f"[{session_id}] Image loaded successfully")
 
+                # Temporarily set crop_scale for this request
+                original_crop_scale = agent.data_processor.crop_scale
+                agent.data_processor.crop_scale = crop_scale
+
                 # Create HLS generator inside background task (safe for concurrent chunks)
                 # This will properly resume existing sessions
                 hls_generator = ProgressiveHLSGenerator(
@@ -1152,6 +1157,9 @@ async def audio_driven_inference_stream(
                 os.remove(img_path)
                 os.remove(aud_path)
                 print(f"[{session_id}] Cleanup complete")
+
+                # Restore original crop_scale
+                agent.data_processor.crop_scale = original_crop_scale
 
             except Exception as e:
                 generation_status[session_id]["status"] = "error"
