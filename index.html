@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMTalker - AI Video Studio</title>
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-hover: #4f46e5;
+            --bg: #0f172a;
+            --card-bg: #1e293b;
+            --text: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1000px;
+            padding: 2rem;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            padding: 2.5rem;
+            border-radius: 1.25rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        h1 {
+            font-size: 1.75rem;
+            margin-bottom: 1.5rem;
+            background: linear-gradient(to right, #818cf8, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 800;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        textarea, input, select {
+            width: 100%;
+            padding: 0.875rem;
+            border-radius: 0.75rem;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            color: white;
+            font-family: inherit;
+            resize: none;
+            box-sizing: border-box;
+            transition: border-color 0.2s;
+        }
+
+        textarea:focus, input:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+
+        button {
+            width: 100%;
+            padding: 1rem;
+            border-radius: 0.75rem;
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 1rem;
+        }
+
+        button:hover {
+            background-color: var(--primary-hover);
+            transform: translateY(-1px);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .video-container {
+            position: relative;
+            aspect-ratio: 16/9;
+            background-color: #000;
+            border-radius: 1rem;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            border: 1px solid #334155;
+            box-shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.06);
+        }
+
+        .video-container img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .placeholder-text {
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.375rem 0.875rem;
+            border-radius: 2rem;
+            font-size: 0.75rem;
+            font-weight: 700;
+            margin-top: 1.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.025em;
+        }
+
+        .status-idle { background: rgba(51, 65, 85, 0.4); color: #94a3b8; }
+        .status-streaming { background: rgba(6, 95, 70, 0.4); color: #34d399; }
+        .status-streaming::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            background: #10b981;
+            border-radius: 50%;
+            margin-right: 8px;
+            box-shadow: 0 0 12px #10b981;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>IMTalker Studio</h1>
+            
+            <div class="form-group">
+                <label for="avatar">Avatar Portrait</label>
+                <select id="avatar">
+                    <option value="assets/source_1.png">Modern Corporate</option>
+                    <option value="assets/source_2.png">Casual Creative</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="text">Synthesis Text</label>
+                <textarea id="text" rows="5" placeholder="Type your message here...">Hello, I am streaming video and audio in perfect synchronization. Welcome to the future of AI communication.</textarea>
+            </div>
+
+            <div class="row" style="display: flex; gap: 1rem; margin-top: 1.5rem;">
+                <button id="start-btn" style="flex: 1;">Start JSON Stream</button>
+                <button id="webrtc-btn" style="flex: 1; background-color: #10b981;">Start WebRTC</button>
+            </div>
+            <div class="row" style="display: flex; gap: 1rem; margin-top: 1rem;">
+                <button id="conv-btn" style="flex: 1; background-color: #8b5cf6;">Start Conversation (AI)</button>
+                <button id="mute-btn" style="flex: 1; background-color: #f43f5e; display: none;">Mute Microphone</button>
+            </div>
+
+            <div id="status" class="status-badge status-idle">Ready</div>
+        </div>
+
+        <div class="card">
+            <div class="video-container" id="video-box">
+                <div class="placeholder-text" id="placeholder">Awaiting video signal...</div>
+                <img id="stream-img" style="display: none;" src="" alt="Stream Output">
+                <video id="webrtc-video" style="display: none; width: 100%; height: 100%; object-fit: cover;" autoplay playsinline></video>
+                <audio id="webrtc-audio" autoplay playsinline></audio>
+            </div>
+            <div style="margin-top: 1.5rem;">
+                <h3 style="font-size: 0.875rem; margin-bottom: 0.5rem; color: var(--text-muted);">Real-time Sync Info</h3>
+                <p id="info" style="font-size: 0.75rem; color: #64748b; line-height: 1.5;">
+                    WebRTC provides the lowest latency and smoothest video flow. 
+                    Conversational mode uses OpenAI to process your speech and generate responses.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const startBtn = document.getElementById('start-btn');
+        const webrtcBtn = document.getElementById('webrtc-btn');
+        const convBtn = document.getElementById('conv-btn');
+        const muteBtn = document.getElementById('mute-btn');
+        const streamImg = document.getElementById('stream-img');
+        const webrtcVideo = document.getElementById('webrtc-video');
+        const placeholder = document.getElementById('placeholder');
+        const statusBadge = document.getElementById('status');
+        const textInput = document.getElementById('text');
+        const avatarSelect = document.getElementById('avatar');
+        const infoText = document.getElementById('info');
+
+        let audioContext;
+        let nextAudioTime = 0;
+        let pc = null;
+        let localStream = null;
+        let isMuted = false;
+
+        muteBtn.addEventListener('click', () => {
+            if (localStream) {
+                isMuted = !isMuted;
+                localStream.getAudioTracks().forEach(track => track.enabled = !isMuted);
+                muteBtn.textContent = isMuted ? 'Unmute Microphone' : 'Mute Microphone';
+                muteBtn.style.backgroundColor = isMuted ? '#10b981' : '#f43f5e';
+            }
+        });
+
+        async function initAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+            }
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+        }
+
+        async function playAudioChunk(base64Wav) {
+            if (!base64Wav) return 0;
+            const binary = atob(base64Wav);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            
+            const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(audioContext.destination);
+            
+            const now = audioContext.currentTime;
+            const startTime = Math.max(now, nextAudioTime);
+            source.start(startTime);
+            nextAudioTime = startTime + audioBuffer.duration;
+            return {
+                startTime,
+                duration: audioBuffer.duration
+            };
+        }
+
+        async function displayFrames(frames, startTime, duration) {
+            if (!frames || frames.length === 0) return;
+            
+            const frameDelay = (duration * 1000) / frames.length;
+            
+            // Wait until the audio is supposed to start (minus a tiny buffer)
+            const waitTime = (startTime - audioContext.currentTime) * 1000;
+            if (waitTime > 0) await new Promise(r => setTimeout(r, waitTime));
+
+            for (const frame of frames) {
+                streamImg.src = `data:image/jpeg;base64,${frame}`;
+                await new Promise(r => setTimeout(r, frameDelay));
+            }
+        }
+
+        // WebRTC Logic
+        async function startWebRTC(conversational = false) {
+            const text = textInput.value.trim();
+            if (!text && !conversational) return;
+
+            if (pc) {
+                pc.close();
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+            }
+
+            webrtcBtn.disabled = true;
+            startBtn.disabled = true;
+            convBtn.disabled = true;
+            statusBadge.textContent = 'WebRTC Signaling...';
+            statusBadge.className = 'status-badge status-streaming';
+            
+            placeholder.style.display = 'none';
+            streamImg.style.display = 'none';
+            webrtcVideo.style.display = 'block';
+
+            let currentSessionID = null;
+
+            try {
+                pc = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                });
+
+                if (conversational) {
+                    console.log("Requesting microphone...");
+                    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+                    infoText.textContent = 'Microphone active. Say something!';
+                    muteBtn.style.display = 'block';
+                    isMuted = false;
+                    muteBtn.textContent = 'Mute Microphone';
+                    muteBtn.style.backgroundColor = '#f43f5e';
+                }
+
+                pc.onicecandidate = (event) => {
+                    if (event.candidate && currentSessionID) {
+                        fetch('/ice', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                session_id: currentSessionID,
+                                candidate: event.candidate
+                            })
+                        }).catch(e => console.error("ICE error:", e));
+                    }
+                };
+
+                pc.oniceconnectionstatechange = () => {
+                    console.log("ICE Connection State:", pc.iceConnectionState);
+                    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                        statusBadge.textContent = conversational ? 'AI Conversation Active' : 'WebRTC Connected';
+                        if (!conversational) infoText.textContent = 'WebRTC stream active.';
+                    } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+                        statusBadge.textContent = 'Disconnected';
+                        statusBadge.className = 'status-badge status-idle';
+                        webrtcBtn.disabled = false;
+                        startBtn.disabled = false;
+                        convBtn.disabled = false;
+                    }
+                };
+
+                pc.ontrack = (event) => {
+                    console.log("Track received:", event.track.kind);
+                    if (event.track.kind === 'video') {
+                        webrtcVideo.srcObject = new MediaStream([event.track]);
+                    } else if (event.track.kind === 'audio') {
+                        console.log("Audio track detected, setting up playback...");
+                        const audioEl = document.getElementById('webrtc-audio');
+                        console.log("Audio element found:", audioEl);
+                        
+                        const audioStream = new MediaStream([event.track]);
+                        console.log("Audio stream created, tracks:", audioStream.getTracks().length);
+                        
+                        audioEl.srcObject = audioStream;
+                        console.log("srcObject set on audio element");
+                        
+                        // Wait a moment for the stream to be ready
+                        setTimeout(() => {
+                            console.log("Attempting to play audio...");
+                            console.log("Audio element muted:", audioEl.muted);
+                            console.log("Audio element volume:", audioEl.volume);
+                            console.log("Audio track enabled:", event.track.enabled);
+                            console.log("Audio track readyState:", event.track.readyState);
+                            console.log("Audio track muted:", event.track.muted);
+                            
+                            audioEl.play().then(() => {
+                                console.log('✅ Audio playback started successfully');
+                                console.log('Final check - muted:', audioEl.muted, 'volume:', audioEl.volume);
+                                
+                                // Monitor audio data
+                                let lastCheck = Date.now();
+                                const monitor = setInterval(() => {
+                                    const now = Date.now();
+                                    if (now - lastCheck > 5000) {
+                                        console.log('Audio status:', {
+                                            playing: !audioEl.paused,
+                                            muted: audioEl.muted,
+                                            volume: audioEl.volume,
+                                            trackEnabled: event.track.enabled,
+                                            trackReadyState: event.track.readyState
+                                        });
+                                        lastCheck = now;
+                                    }
+                                }, 1000);
+                            }).catch(e => {
+                                console.error('❌ Audio play failed:', e);
+                                console.log('Trying to unmute and play again...');
+                                audioEl.muted = false;
+                                audioEl.volume = 1.0;
+                                return audioEl.play();
+                            }).catch(e => {
+                                console.error('❌ Second play attempt failed:', e);
+                            });
+                        }, 100);
+                    }
+                };
+
+                // Add transceivers if not adding tracks manually
+                if (!conversational) {
+                    pc.addTransceiver('video', { direction: 'recvonly' });
+                    pc.addTransceiver('audio', { direction: 'recvonly' });
+                } else {
+                    // We still need to receive video and audio response
+                    pc.addTransceiver('video', { direction: 'recvonly' });
+                    pc.addTransceiver('audio', { direction: 'recvonly' });
+                }
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                const response = await fetch('/offer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: pc.localDescription.sdp,
+                        type: pc.localDescription.type,
+                        text: text,
+                        avatar: avatarSelect.value,
+                        conv_mode: conversational
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Server responded with ${response.status}`);
+                }
+
+                const data = await response.json();
+                currentSessionID = data.session_id;
+                
+                await pc.setRemoteDescription(new RTCSessionDescription({
+                    sdp: data.sdp,
+                    type: data.type
+                }));
+
+                statusBadge.textContent = 'Connecting...';
+
+            } catch (err) {
+                console.error('WebRTC error:', err);
+                statusBadge.textContent = 'Error';
+                statusBadge.className = 'status-badge status-idle';
+                infoText.textContent = `WebRTC Error: ${err.message}`;
+                webrtcBtn.disabled = false;
+                startBtn.disabled = false;
+                convBtn.disabled = false;
+            }
+        }
+
+        webrtcBtn.addEventListener('click', () => startWebRTC(false));
+        convBtn.addEventListener('click', () => startWebRTC(true));
+
+        startBtn.addEventListener('click', async () => {
+            const text = textInput.value.trim();
+            if (!text) return;
+
+            await initAudio();
+            nextAudioTime = audioContext.currentTime;
+
+            startBtn.disabled = true;
+            webrtcBtn.disabled = true;
+            convBtn.disabled = true;
+            statusBadge.textContent = 'JSON Streaming';
+            statusBadge.className = 'status-badge status-streaming';
+            
+            placeholder.style.display = 'none';
+            webrtcVideo.style.display = 'none';
+            streamImg.style.display = 'block';
+
+            try {
+                const response = await fetch('/generate_stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        text: text,
+                        avatar: avatarSelect.value
+                    })
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // Keep partial line
+
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+                        const data = JSON.parse(line);
+                        
+                        // Process chunks concurrently
+                        const audioTask = playAudioChunk(data.audio);
+                        audioTask.then(audioInfo => {
+                            if (audioInfo) {
+                                displayFrames(data.frames, audioInfo.startTime, audioInfo.duration);
+                            }
+                        });
+                    }
+                }
+            } catch (err) {
+                console.error('Streaming error:', err);
+                infoText.textContent = `Error: ${err.message}`;
+            } finally {
+                statusBadge.textContent = 'Finished';
+                statusBadge.className = 'status-badge status-idle';
+                startBtn.disabled = false;
+                webrtcBtn.disabled = false;
+                convBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

@@ -17,7 +17,7 @@ class ParallelRenderer:
     Handles parallel frame rendering with proper thread safety and error handling.
     """
     
-    def __init__(self, agent, num_workers: int = 2, chunk_size: int = 5):
+    def __init__(self, agent, num_workers: int = 1, chunk_size: int = 5):
         """
         Args:
             agent: InferenceAgent instance

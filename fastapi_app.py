@@ -20,13 +20,16 @@ import base64
 import gradio as gr
 import glob
 import re
+import io
+import traceback
+import struct
 from PIL import Image
 import torchvision.transforms as transforms
 from transformers import Wav2Vec2FeatureExtractor
 from tqdm import tqdm
 import random
 from huggingface_hub import hf_hub_download
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks, Request, WebSocket
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +51,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from app import AppConfig, ensure_checkpoints, DataProcessor
 from parallel_renderer import ParallelRenderer
+from realtime_streaming import RealtimeSession
 
 # Try importing local modules
 try:
@@ -83,6 +87,179 @@ output_dir = "./outputs"
 import threading
 from dataclasses import dataclass, field
 from typing import Dict, List
+
+# Import librosa for audio resampling
+try:
+    import librosa
+except ImportError:
+    print("Warning: librosa not installed. Audio resampling may not work. Install with: pip install librosa")
+    librosa = None
+
+
+# ============================================================================
+# REAL-TIME CHUNKED AUDIO STREAMING
+# ============================================================================
+
+class AudioChunkBuffer:
+    """
+    Buffer for accumulating audio chunks for real-time inference.
+    Supports sliding window processing with overlap.
+    """
+    
+    def __init__(self, 
+                 session_id: str,
+                 target_sr: int = 16000,
+                 chunk_duration: float = 1.0,
+                 overlap_ratio: float = 0.2):
+        """
+        Args:
+            session_id: Unique session ID
+            target_sr: Target sampling rate (16kHz for wav2vec2)
+            chunk_duration: Duration of audio chunk to accumulate (seconds)
+            overlap_ratio: Overlap between chunks (0.2 = 20% overlap)
+        """
+        self.session_id = session_id
+        self.target_sr = target_sr
+        self.chunk_duration = chunk_duration
+        self.overlap_ratio = overlap_ratio
+        
+        # Buffer size: samples for target duration
+        self.chunk_samples = int(chunk_duration * target_sr)
+        self.overlap_samples = int(self.chunk_samples * overlap_ratio)
+        self.stride_samples = self.chunk_samples - self.overlap_samples
+        
+        # Audio accumulator (numpy float32, -1.0 to 1.0)
+        self.buffer = np.array([], dtype=np.float32)
+        self.total_samples_received = 0
+        self.lock = threading.Lock()
+        
+        print(f"[AudioBuffer {session_id}] Initialized:")
+        print(f"  Target SR: {target_sr}Hz")
+        print(f"  Chunk duration: {chunk_duration}s ({self.chunk_samples} samples)")
+        print(f"  Overlap: {overlap_ratio*100:.0f}% ({self.overlap_samples} samples)")
+        print(f"  Stride: {self.stride_samples} samples")
+    
+    def add_chunk(self, audio_chunk: np.ndarray, source_sr: int = 24000) -> bool:
+        """
+        Add an audio chunk and resample if needed.
+        
+        Args:
+            audio_chunk: Audio samples (1D or 2D array)
+            source_sr: Source sampling rate of the chunk
+            
+        Returns:
+            True if buffer now has enough samples for processing
+        """
+        with self.lock:
+            try:
+                # Ensure 1D
+                if audio_chunk.ndim > 1:
+                    audio_chunk = audio_chunk.flatten()
+                
+                # Resample if needed
+                if source_sr != self.target_sr:
+                    print(f"[AudioBuffer {self.session_id}] Resampling {len(audio_chunk)} samples from {source_sr}Hz → {self.target_sr}Hz")
+                    audio_chunk = librosa.resample(
+                        audio_chunk, 
+                        orig_sr=source_sr, 
+                        target_sr=self.target_sr
+                    )
+                
+                # Append to buffer
+                self.buffer = np.concatenate([self.buffer, audio_chunk.astype(np.float32)])
+                self.total_samples_received += len(audio_chunk)
+                
+                has_enough = len(self.buffer) >= self.chunk_samples
+                
+                print(f"[AudioBuffer {self.session_id}] Chunk added: {len(audio_chunk)} samples → "
+                      f"buffer now {len(self.buffer)} samples (need {self.chunk_samples}) "
+                      f"[total_received: {self.total_samples_received}]")
+                
+                return has_enough
+                
+            except Exception as e:
+                print(f"[AudioBuffer {self.session_id}] Error adding chunk: {e}")
+                raise
+    
+    def get_chunk(self) -> Optional[np.ndarray]:
+        """
+        Get next processable audio chunk from buffer (with stride/overlap).
+        
+        Returns:
+            Audio tensor for inference, or None if not enough data
+        """
+        with self.lock:
+            if len(self.buffer) < self.chunk_samples:
+                return None
+            
+            # Extract chunk
+            chunk = self.buffer[:self.chunk_samples].copy()
+            
+            # Slide buffer by stride (move window forward with overlap)
+            self.buffer = self.buffer[self.stride_samples:]
+            
+            print(f"[AudioBuffer {self.session_id}] Extracted chunk: "
+                  f"{self.chunk_samples} samples, buffer now {len(self.buffer)} samples remaining")
+            
+            return chunk
+    
+    def has_pending_audio(self) -> bool:
+        """Check if there's unprocessed audio in the buffer"""
+        with self.lock:
+            return len(self.buffer) >= self.chunk_samples
+    
+    def finalize(self) -> Optional[np.ndarray]:
+        """
+        Get any remaining audio (at end of stream).
+        Pads with zeros if needed to match chunk_samples.
+        """
+        with self.lock:
+            if len(self.buffer) == 0:
+                return None
+            
+            # Pad to match chunk size
+            if len(self.buffer) < self.chunk_samples:
+                padding = np.zeros(self.chunk_samples - len(self.buffer), dtype=np.float32)
+                chunk = np.concatenate([self.buffer, padding])
+                print(f"[AudioBuffer {self.session_id}] Final chunk: {len(self.buffer)} samples + "
+                      f"{len(padding)} zero-padding = {len(chunk)} samples")
+            else:
+                chunk = self.buffer[:self.chunk_samples].copy()
+                print(f"[AudioBuffer {self.session_id}] Final chunk: {len(chunk)} samples")
+            
+            # Clear buffer
+            self.buffer = np.array([], dtype=np.float32)
+            return chunk
+    
+    def reset(self):
+        """Clear buffer for new session"""
+        with self.lock:
+            self.buffer = np.array([], dtype=np.float32)
+            self.total_samples_received = 0
+            print(f"[AudioBuffer {self.session_id}] Buffer reset")
+
+
+@dataclass
+class ChunkedStreamSession:
+    """Represents an active chunked audio-to-video streaming session"""
+    session_id: str
+    image_pil: Image.Image
+    audio_buffer: AudioChunkBuffer
+    hls_generator: Optional["ProgressiveHLSGenerator"]
+    parameters: dict  # crop, seed, nfe, cfg_scale, etc.
+    status: str = "waiting_for_audio"  # waiting_for_audio, processing, complete, error
+    error_message: Optional[str] = None
+    total_frames_generated: int = 0
+    created_at: float = field(default_factory=time.time)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+# Storage for chunked streaming sessions
+chunked_sessions: Dict[str, ChunkedStreamSession] = {}
+
+# Storage for real-time streaming sessions
+realtime_sessions: Dict[str, RealtimeSession] = {}
+
 
 class InferenceAgent:
     def __init__(self, opt):
@@ -249,15 +426,25 @@ class InferenceAgent:
 
         if is_streaming:
             # PARALLEL RENDERING - Up to 2.5x faster!
-            print(f"Rendering {T} frames using parallel renderer ({self.opt.num_render_workers} workers)...")
-            d_hat = self.parallel_renderer.render_parallel(
-                sample,
-                g_r,
-                m_r,
-                f_r,
-                progress_callback=lambda curr,
-                total: print(f"  Progress: {curr}/{total} chunks")
-            )
+            # print(f"Rendering {T} frames using parallel renderer ({self.opt.num_render_workers} workers)...")
+            # d_hat = self.parallel_renderer.render_parallel(
+            #     sample,
+            #     g_r,
+            #     m_r,
+            #     f_r,
+            #     progress_callback=lambda curr,
+            #     total: print(f"  Progress: {curr}/{total} chunks")
+            # )
+            d_hat = []
+            for t in range(T):
+                ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+                m_c = self.renderer.latent_token_decoder(ta_c)
+                out_frame = self.renderer.decode(m_c, m_r, f_r)
+                # Move to CPU immediately to save memory
+                d_hat.append(out_frame.cpu())
+                # Clear cache periodically
+                if t % 10 == 0 and self.device == "mps":
+                    torch.mps.empty_cache()
         else:
             # STANDARD RENDERING - Single-threaded
             print(f"Rendering {T} frames...")
@@ -384,10 +571,30 @@ class InferenceAgent:
 
         # PROGRESSIVE PARALLEL HLS RENDERING - Streams as it renders!
         print(f"Progressive HLS: Rendering {T} frames with {self.opt.num_render_workers} workers...")
-        self.parallel_renderer.render_progressive_hls(
-            sample, g_r, m_r, f_r,
-            hls_generator
-        )
+        # self.parallel_renderer.render_progressive_hls(
+        #     sample, g_r, m_r, f_r,
+        #     hls_generator
+        # )
+
+        # Generate frames progressively
+        for t in range(T):
+            ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+            m_c = self.renderer.latent_token_decoder(ta_c)
+            out_frame = self.renderer.decode(m_c, m_r, f_r)
+
+            # Convert frame to numpy for HLS generator
+            frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+            if frame_np.min() < 0:
+                frame_np = (frame_np + 1) / 2
+            frame_np = np.clip(frame_np, 0, 1)
+            frame_np = (frame_np * 255).astype(np.uint8)
+
+            # Add frame to HLS generator (will create segments automatically)
+            hls_generator.add_frame(frame_np)
+
+            # Clear cache periodically
+            if t % 10 == 0 and self.device == "mps":
+                torch.mps.empty_cache()
 
         # Finalize HLS stream - mark complete only if this is the final chunk
         hls_generator.finalize(audio_path=aud_path, mark_complete=is_final_chunk)
@@ -464,6 +671,239 @@ class InferenceAgent:
 
         return self.save_video(vid_tensor, fps=fps, audio_path=driving_video_path)
 
+    @torch.no_grad()
+    def run_audio_inference_chunked(
+        self,
+        img_pil,
+        audio_chunk_np: np.ndarray,
+        crop,
+        seed,
+        nfe,
+        cfg_scale,
+        hls_generator: "ProgressiveHLSGenerator",
+        pose_style=None,
+        gaze_style=None,
+    ):
+        """
+        Run audio inference with a single audio chunk (real-time streaming mode).
+        Processes one audio chunk at a time and streams frames immediately.
+        
+        Args:
+            img_pil: PIL Image of source face
+            audio_chunk_np: Single audio chunk (numpy array, already resampled to 16kHz)
+            crop: Whether to crop face
+            seed: Random seed
+            nfe: Number of function evaluations
+            cfg_scale: Classifier-free guidance scale
+            hls_generator: HLS generator for writing frames
+            pose_style: Optional pose parameters
+            gaze_style: Optional gaze parameters
+        """
+        # Clear memory
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        try:
+            # Image preprocessing (only once per session, done by caller)
+            s_pil = (
+                self.data_processor.process_img(img_pil)
+                if crop
+                else img_pil.resize((self.opt.input_size, self.opt.input_size))
+            )
+            s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+            
+            # Convert numpy chunk to torch tensor (16kHz audio)
+            # audio_chunk_np is shape (16000,) or similar - wav2vec expects this
+            audio_feat = torch.from_numpy(audio_chunk_np).float().unsqueeze(0).to(self.device)
+            
+            # Process with feature extractor (Wav2Vec2)
+            a_tensor = audio_feat  # Already in correct format
+            
+            data = {
+                "s": s_tensor,
+                "a": a_tensor,
+                "pose": None,
+                "cam": None,
+                "gaze": None,
+                "ref_x": None,
+            }
+
+            # Calculate target frame count T based on audio chunk length
+            T = math.ceil(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+
+            if pose_style is not None:
+                p_tensor = (
+                    torch.tensor(pose_style, device=self.device)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(1, T, 3)
+                )
+                data["pose"] = p_tensor
+
+            if gaze_style is not None:
+                g_tensor = (
+                    torch.tensor(gaze_style, device=self.device)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                    .expand(1, T, 2)
+                )
+                data["gaze"] = g_tensor
+
+            # Feature extraction
+            f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
+            t_lat = self.renderer.latent_token_encoder(s_tensor)
+            if isinstance(t_lat, tuple):
+                t_lat = t_lat[0]
+            data["ref_x"] = t_lat
+
+            # Generate motion
+            torch.manual_seed(seed)
+            sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+
+            # Stabilization
+            motion_scale = 0.6
+            sample = (1.0 - motion_scale) * t_lat.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
+
+            T = sample.shape[1]
+            ta_r = self.renderer.adapt(t_lat, g_r)
+            m_r = self.renderer.latent_token_decoder(ta_r)
+
+            # Render frames progressively
+            frames_rendered = 0
+            for t in range(T):
+                ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+                m_c = self.renderer.latent_token_decoder(ta_c)
+                out_frame = self.renderer.decode(m_c, m_r, f_r)
+
+                # Convert to numpy
+                frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                if frame_np.min() < 0:
+                    frame_np = (frame_np + 1) / 2
+                frame_np = np.clip(frame_np, 0, 1)
+                frame_np = (frame_np * 255).astype(np.uint8)
+
+                # Add to HLS generator
+                hls_generator.add_frame(frame_np)
+                frames_rendered += 1
+
+                # Clear cache periodically
+                if t % 10 == 0 and self.device == "mps":
+                    torch.mps.empty_cache()
+
+            print(f"[ChunkedInference] Rendered {frames_rendered} frames from audio chunk")
+            return frames_rendered
+
+        except Exception as e:
+            print(f"[ChunkedInference] Error during inference: {e}")
+            traceback.print_exc()
+            raise
+        finally:
+            # Final cleanup
+            if self.device == "mps":
+                torch.mps.empty_cache()
+            elif self.device == "cuda":
+                torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def preprocess_for_realtime(self, img_pil, crop=True):
+        """Pre-calculate static features for real-time inference (run once per session)"""
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
+        # Image processing
+        s_pil = (
+            self.data_processor.process_img(img_pil)
+            if crop
+            else img_pil.resize((self.opt.input_size, self.opt.input_size))
+        )
+        s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
+        
+        # Feature extraction (static for the session)
+        f_r, g_r = self.renderer.dense_feature_encoder(s_tensor)
+        t_lat = self.renderer.latent_token_encoder(s_tensor)
+        if isinstance(t_lat, tuple):
+            t_lat = t_lat[0]
+            
+        return {
+            "s_tensor": s_tensor,
+            "f_r": f_r,
+            "g_r": g_r,
+            "t_lat": t_lat,
+            "ref_x": t_lat
+        }
+
+    @torch.no_grad()
+    def warmup_realtime(self):
+        """Optional warmup to ensure CUDA context is ready"""
+        pass
+
+    @torch.no_grad()
+    def run_realtime_step(self, preprocessed, audio_chunk, is_silence=False):
+        """
+        Run inference for a single frame.
+        
+        Args:
+            preprocessed: Dict from preprocess_for_realtime
+            audio_chunk: Float32 numpy array (1 frame worth of audio)
+            is_silence: Bool indicating if this is silence (optimization hint)
+        """
+        # audio_chunk needs to be compatible with wav2vec2 feature extractor?
+        # DataProcessor.process_audio usually loads from file.
+        # Here we have raw numpy.
+        
+        a_tensor = torch.from_numpy(audio_chunk).float().to(self.device)
+        if a_tensor.dim() == 1:
+            a_tensor = a_tensor.unsqueeze(0) # (1, L)
+            
+        data = {
+            "s": preprocessed["s_tensor"],
+            "a": a_tensor,
+            "pose": None,
+            "cam": None,
+            "gaze": None,
+            "ref_x": preprocessed["ref_x"]
+        }
+        
+        # Sampling
+        nfe = 10 
+        cfg_scale = 2.0
+        seed = random.randint(0, 1000000)
+        
+        torch.manual_seed(seed)
+        
+        sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+        
+        # Stabilization
+        motion_scale = 0.6
+        t_lat = preprocessed["t_lat"]
+        sample = (1.0 - motion_scale) * t_lat.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
+        
+        # Decode (First frame only)
+        g_r = preprocessed["g_r"]
+        f_r = preprocessed["f_r"]
+        m_r = self.renderer.latent_token_decoder(self.renderer.adapt(t_lat, g_r))
+        
+        ta_c = self.renderer.adapt(sample[:, 0, ...], g_r)
+        m_c = self.renderer.latent_token_decoder(ta_c)
+        out_frame = self.renderer.decode(m_c, m_r, f_r)
+        
+        # To JPEG
+        frame = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+        if frame.min() < 0:
+            frame = (frame + 1) / 2
+        frame = np.clip(frame, 0, 1)
+        frame = (frame * 255).astype(np.uint8)
+        
+        # RGB to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # Compress to JPEG
+        ret, jpeg = cv2.imencode('.jpg', frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        return jpeg.tobytes()
 
 
 @dataclass
@@ -620,13 +1060,13 @@ app.mount("/hls", StaticFiles(directory=str(HLS_OUTPUT_DIR)), name="hls")
 generation_status = {}
 
 
-def cleanup_hls_session(session_id: str, delay_minutes: int = 5):
+def cleanup_hls_session(session_id: str, delay_minutes: int = 50):
     """
     Schedule cleanup of HLS output directory after a delay
     
     Args:
         session_id: The session ID to clean up
-        delay_minutes: Minutes to wait before cleanup (default 5)
+        delay_minutes: Minutes to wait before cleanup (default 50)
     """
     def _cleanup():
         import time
@@ -699,11 +1139,7 @@ class ProgressiveHLSGenerator:
         self.frame_buffer.append(frame)
         self.total_frames += 1
 
-        if self.total_frames % 25 == 0:  # Log every second of video
-            print(f"[HLS {self.session_id}] Progress: {self.total_frames} frames, buffer: {len(self.frame_buffer)}/{self.frames_per_segment}")
-
         if len(self.frame_buffer) >= self.frames_per_segment:
-            print(f"[HLS {self.session_id}] Buffer full ({len(self.frame_buffer)} frames), writing segment...")
             self._write_segment()
             self._update_playlist()
 
@@ -952,8 +1388,8 @@ class ProgressiveHLSGenerator:
             self.is_complete = True
             print(f"[HLS {self.session_id}] Stream marked as COMPLETE")
             
-            # Schedule cleanup after 5 minutes
-            cleanup_hls_session(self.session_id, delay_minutes=5)
+            # Schedule cleanup after 50 minutes
+            cleanup_hls_session(self.session_id, delay_minutes=50)
         
         self._update_playlist()
         print(f"[HLS {self.session_id}] Total frames generated: {self.total_frames}")
@@ -977,23 +1413,53 @@ def convert_video_to_hls(
     playlist_path = output_dir / playlist_name
 
     # FFmpeg command to convert to HLS
+    # cmd = [
+    #     "ffmpeg",
+    #     "-i",
+    #     video_path,
+    #     "-codec:",
+    #     "copy",
+    #     "-start_number",
+    #     "0",
+    #     "-hls_time",
+    #     str(segment_duration),
+    #     "-hls_list_size",
+    #     "0",
+    #     "-hls_segment_filename",
+    #     str(output_dir / "segment%03d.ts"),
+    #     "-f",
+    #     "hls",
+    #     str(playlist_path),
+    #     "-y",
+    # ]
     cmd = [
         "ffmpeg",
-        "-i",
-        video_path,
-        "-codec:",
-        "copy",
-        "-start_number",
-        "0",
-        "-hls_time",
-        str(segment_duration),
-        "-hls_list_size",
-        "0",
-        "-hls_segment_filename",
-        str(output_dir / "segment%03d.ts"),
-        "-f",
-        "hls",
-        str(playlist_path),
+        "-re",
+        "-i", video_path,
+
+        # Video
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+        "-profile:v", "baseline",
+        "-level", "3.1",
+        "-pix_fmt", "yuv420p",
+        "-g", "48",
+        "-keyint_min", "48",
+        "-sc_threshold", "0",
+
+        # Audio
+        "-c:a", "aac",
+        "-b:a", "128k",
+
+        # HLS
+        "-hls_time", str(segment_duration),
+        "-hls_list_size", "6",
+        "-hls_flags", "delete_segments+independent_segments",
+        "-hls_segment_filename", str(output_dir / "segment_%03d.ts"),
+        "-f", "hls",
+        str(output_dir / "playlist.m3u8"),
+
         "-y",
     ]
 
@@ -1190,39 +1656,363 @@ async def audio_driven_inference_stream(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================================
+# REAL-TIME CHUNKED AUDIO-DRIVEN INFERENCE
+# ============================================================================
+
+@app.post("/api/audio-driven/chunked/init")
+async def chunked_stream_init(
+    image: UploadFile = File(..., description="Source image file (PNG, JPG)"),
+    session_id: Optional[str] = Form(None, description="Optional session ID (auto-generated if not provided)"),
+    crop: bool = Form(True, description="Auto crop face from image"),
+    seed: int = Form(42, description="Random seed for generation"),
+    nfe: int = Form(10, description="Number of function evaluations (steps), range: 5-50"),
+    cfg_scale: float = Form(2.0, description="Classifier-free guidance scale, range: 1.0-5.0"),
+    chunk_duration: float = Form(1.0, description="Duration of each audio chunk to process (seconds)"),
+    audio_sample_rate: int = Form(24000, description="Sample rate of incoming audio chunks (Hz)"),
+    pose_style: Optional[str] = Form(None, description="Optional pose style as JSON array [pitch, yaw, roll]"),
+    gaze_style: Optional[str] = Form(None, description="Optional gaze style as JSON array [x, y]"),
+):
+    """
+    Initialize a real-time chunked audio-driven inference session.
+    Call this ONCE at the start, then send audio chunks via /api/audio-driven/chunked/feed.
+    
+    Returns:
+        session_id: Use this to feed audio chunks and get the HLS stream
+        hls_url: URL to HLS playlist for real-time video display
+    """
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Models not loaded properly")
+    
+    # Validate parameters
+    if nfe < 5 or nfe > 50:
+        raise HTTPException(status_code=400, detail="nfe must be between 5 and 50")
+    if cfg_scale < 1.0 or cfg_scale > 5.0:
+        raise HTTPException(status_code=400, detail="cfg_scale must be between 1.0 and 5.0")
+    if chunk_duration < 0.1 or chunk_duration > 10.0:
+        raise HTTPException(status_code=400, detail="chunk_duration must be between 0.1 and 10.0 seconds")
+    
+    try:
+        # Generate session ID if not provided
+        sid = session_id or str(uuid.uuid4())
+        
+        # Create HLS output directory
+        session_dir = HLS_OUTPUT_DIR / sid
+        session_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"[ChunkedInit {sid}] Initializing chunked stream session")
+        
+        # Load and validate image
+        img_data = await image.read()
+        img_pil = Image.open(io.BytesIO(img_data)).convert('RGB')
+        print(f"[ChunkedInit {sid}] Image loaded: {img_pil.size}")
+        
+        # Initialize audio buffer
+        audio_buffer = AudioChunkBuffer(
+            session_id=sid,
+            target_sr=16000,  # wav2vec2 requires 16kHz
+            chunk_duration=chunk_duration,
+            overlap_ratio=0.2
+        )
+        
+        # Initialize HLS generator
+        hls_generator = ProgressiveHLSGenerator(
+            session_id=sid,
+            fps=cfg.fps if cfg else 25.0,
+            segment_duration=2,
+            audio_path=None  # Audio will be added per-chunk
+        )
+        
+        # Parse pose/gaze styles
+        pose_arr = json.loads(pose_style) if pose_style else None
+        gaze_arr = json.loads(gaze_style) if gaze_style else None
+        
+        # Create session object
+        session = ChunkedStreamSession(
+            session_id=sid,
+            image_pil=img_pil,
+            audio_buffer=audio_buffer,
+            hls_generator=hls_generator,
+            parameters={
+                "crop": crop,
+                "seed": seed,
+                "nfe": nfe,
+                "cfg_scale": cfg_scale,
+                "audio_sample_rate": audio_sample_rate,
+                "pose_style": pose_arr,
+                "gaze_style": gaze_arr,
+            }
+        )
+        
+        # Store session
+        chunked_sessions[sid] = session
+        
+        print(f"[ChunkedInit {sid}] ✓ Session initialized. Ready for audio chunks.")
+        
+        return {
+            "status": "success",
+            "session_id": sid,
+            "hls_url": f"/hls/{sid}/playlist.m3u8",
+            "message": "Session ready. Send audio chunks to /api/audio-driven/chunked/feed",
+            "chunk_duration": chunk_duration,
+            "audio_sample_rate": audio_sample_rate,
+        }
+        
+    except Exception as e:
+        print(f"[ChunkedInit] Error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/audio-driven/chunked/feed")
+async def chunked_stream_feed(
+    background_tasks: BackgroundTasks,
+    session_id: str = Form(..., description="Session ID from init"),
+    audio_chunk: UploadFile = File(..., description="Audio chunk (WAV, MP3, etc.)"),
+    is_final_chunk: bool = Form(False, description="Set to True for the last chunk"),
+):
+    """
+    Feed an audio chunk to an active chunked streaming session.
+    Processes audio immediately and streams generated frames via HLS.
+    
+    Call this repeatedly with audio chunks until is_final_chunk=True.
+    """
+    if session_id not in chunked_sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found. Call /api/audio-driven/chunked/init first.")
+    
+    session = chunked_sessions[session_id]
+    
+    try:
+        print(f"[ChunkedFeed {session_id}] Received audio chunk (final={is_final_chunk})")
+        
+        # Load audio chunk
+        audio_data = await audio_chunk.read()
+        
+        # Use librosa to load audio and get sample rate
+        if librosa is None:
+            raise HTTPException(status_code=500, detail="librosa not installed. Cannot process audio chunks.")
+        
+        audio_chunk_np, sr = librosa.load(io.BytesIO(audio_data), sr=None)
+        print(f"[ChunkedFeed {session_id}] Loaded audio: {len(audio_chunk_np)} samples at {sr}Hz")
+        
+        # Add to buffer (auto-resamples to 16kHz)
+        has_enough = session.audio_buffer.add_chunk(audio_chunk_np, source_sr=sr)
+        
+        def process_audio_chunks():
+            """Background task to process audio chunks and generate video frames"""
+            try:
+                session.status = "processing"
+                
+                # Process all available chunks in the buffer
+                while session.audio_buffer.has_pending_audio():
+                    audio_chunk_16k = session.audio_buffer.get_chunk()
+                    if audio_chunk_16k is None:
+                        break
+                    
+                    print(f"[ChunkedFeed {session_id}] Processing audio chunk: {len(audio_chunk_16k)} samples")
+                    
+                    # Run inference on this chunk
+                    frames = agent.run_audio_inference_chunked(
+                        img_pil=session.image_pil,
+                        audio_chunk_np=audio_chunk_16k,
+                        crop=session.parameters["crop"],
+                        seed=session.parameters["seed"],
+                        nfe=session.parameters["nfe"],
+                        cfg_scale=session.parameters["cfg_scale"],
+                        hls_generator=session.hls_generator,
+                        pose_style=session.parameters["pose_style"],
+                        gaze_style=session.parameters["gaze_style"],
+                    )
+                    
+                    session.total_frames_generated += frames
+                    print(f"[ChunkedFeed {session_id}] Total frames generated so far: {session.total_frames_generated}")
+                
+                # If this is the final chunk, process any remaining audio
+                if is_final_chunk:
+                    final_chunk = session.audio_buffer.finalize()
+                    if final_chunk is not None:
+                        print(f"[ChunkedFeed {session_id}] Processing final audio chunk")
+                        frames = agent.run_audio_inference_chunked(
+                            img_pil=session.image_pil,
+                            audio_chunk_np=final_chunk,
+                            crop=session.parameters["crop"],
+                            seed=session.parameters["seed"],
+                            nfe=session.parameters["nfe"],
+                            cfg_scale=session.parameters["cfg_scale"],
+                            hls_generator=session.hls_generator,
+                            pose_style=session.parameters["pose_style"],
+                            gaze_style=session.parameters["gaze_style"],
+                        )
+                        session.total_frames_generated += frames
+                    
+                    # Mark HLS stream as complete
+                    session.hls_generator.finalize(mark_complete=True)
+                    session.status = "complete"
+                    print(f"[ChunkedFeed {session_id}] ✓ Stream finalized. Total frames: {session.total_frames_generated}")
+                    
+                    # Schedule cleanup
+                    cleanup_hls_session(session_id, delay_minutes=50)
+                else:
+                    session.status = "waiting_for_audio"
+                    
+            except Exception as e:
+                session.status = "error"
+                session.error_message = str(e)
+                print(f"[ChunkedFeed {session_id}] Error processing audio: {e}")
+                traceback.print_exc()
+        
+        # Start processing in background if we have enough audio buffered
+        if has_enough or is_final_chunk:
+            background_tasks.add_task(process_audio_chunks)
+        
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "buffer_samples": session.audio_buffer.total_samples_received,
+            "frames_generated": session.total_frames_generated,
+            "session_status": session.status,
+            "message": "Audio chunk received and queued for processing"
+        }
+        
+    except Exception as e:
+        session.status = "error"
+        session.error_message = str(e)
+        print(f"[ChunkedFeed {session_id}] Error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/audio-driven/chunked/status/{session_id}")
+async def chunked_stream_status(session_id: str):
+    """Get the status of an active chunked streaming session"""
+    if session_id not in chunked_sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    
+    session = chunked_sessions[session_id]
+    
+    return {
+        "session_id": session_id,
+        "status": session.status,
+        "total_frames_generated": session.total_frames_generated,
+        "buffer_samples": session.audio_buffer.total_samples_received,
+        "error": session.error_message,
+        "created_at": session.created_at,
+        "uptime_seconds": time.time() - session.created_at,
+    }
+
+
+@app.delete("/api/audio-driven/chunked/session/{session_id}")
+async def chunked_stream_cleanup(session_id: str):
+    """Manually cleanup a chunked streaming session"""
+    if session_id not in chunked_sessions:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    
+    try:
+        # Remove session
+        del chunked_sessions[session_id]
+        
+        # Remove HLS files
+        session_dir = HLS_OUTPUT_DIR / session_id
+        if session_dir.exists():
+            shutil.rmtree(session_dir)
+        
+        return {
+            "status": "success",
+            "message": f"Session {session_id} cleaned up"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/hls/{session_id}/playlist.m3u8")
 async def get_playlist(session_id: str):
     """
-    Get HLS playlist file for a session
+    Get HLS playlist file for a session.
+    
+    Waits for the first segment to be ready before returning the playlist.
+    This ensures the playlist contains at least one #EXTINF entry and segment_000.ts exists.
     """
     playlist_path = HLS_OUTPUT_DIR / session_id / "playlist.m3u8"
+    segment_path = HLS_OUTPUT_DIR / session_id / "segment000.ts"
 
     if not playlist_path.exists():
         raise HTTPException(status_code=404, detail="Playlist not found")
 
-    return FileResponse(
-        playlist_path,
-        media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "no-cache"},
+    # Wait up to 60 seconds for first segment and valid playlist
+    max_wait_seconds = 60
+    check_interval = 0.1  # Check every 100ms
+    elapsed = 0
+
+    while elapsed < max_wait_seconds:
+        # Check if first segment exists
+        if not segment_path.exists():
+            await asyncio.sleep(check_interval)
+            elapsed += check_interval
+            continue
+
+        # Check if playlist contains at least one #EXTINF entry
+        try:
+            with open(playlist_path, 'r') as f:
+                content = f.read()
+                if '#EXTINF' in content:
+                    # Playlist is ready!
+                    return FileResponse(
+                        playlist_path,
+                        media_type="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-cache"},
+                    )
+        except Exception:
+            pass
+
+        await asyncio.sleep(check_interval)
+        elapsed += check_interval
+
+    # Timeout - still waiting for first segment
+    raise HTTPException(
+        status_code=202,
+        detail=f"Playlist not ready yet. Waiting for first segment to be generated (segment_000.ts must exist and playlist must contain #EXTINF)"
     )
 
-
 @app.get("/api/hls/{session_id}/segment{segment_num}.ts")
-async def get_segment(session_id: str, segment_num: str):
-    """
-    Get HLS video segment for a session
-    """
+async def get_segment(
+    session_id: str,
+    segment_num: str,
+    request: Request
+):
     segment_path = HLS_OUTPUT_DIR / session_id / f"segment{segment_num}.ts"
 
     if not segment_path.exists():
         raise HTTPException(status_code=404, detail="Segment not found")
 
-    return FileResponse(
-        segment_path,
-        media_type="video/mp2t",
-        headers={"Cache-Control": "public, max-age=31536000"},
-    )
+    file_size = os.path.getsize(segment_path)
+    range_header = request.headers.get("range")
 
+    if not range_header:
+        # hls.js ALWAYS sends Range — if missing, reject
+        raise HTTPException(status_code=416, detail="Range header required")
+
+    start, end = range_header.replace("bytes=", "").split("-")
+    start = int(start)
+    end = int(end) if end else file_size - 1
+
+    def iterfile():
+        with open(segment_path, "rb") as f:
+            f.seek(start)
+            yield f.read(end - start + 1)
+
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(end - start + 1),
+        "Cache-Control": "no-cache",
+        "Content-Type": "video/mp2t",
+    }
+
+    return StreamingResponse(
+        iterfile(),
+        status_code=206,
+        headers=headers,
+    )
 
 @app.get("/api/hls/{session_id}/download")
 async def download_full_video(session_id: str):
@@ -1341,7 +2131,8 @@ async def audio_driven_inference(
         "crop": crop,
         "seed": seed,
         "nfe": nfe,
-        "cfg_scale": cfg_scale
+        "cfg_scale": cfg_scale,
+        "crop_scale": crop_scale
     })
     if agent is None:
         raise HTTPException(status_code=503, detail="Models not loaded properly")
@@ -1724,7 +2515,7 @@ async def realtime_streaming_sse(
                         print(f"[REALTIME-SSE] Streamed {frame_count} frames ({fps:.1f} fps)")
                     
                     # Small delay to control frame rate
-                    await asyncio.sleep(1.0 / 30.0)  # ~30 fps delivery
+                    await asyncio.sleep(1.0 / 30.0)  # ~30 fps deivery
                 
                 # Send completion event
                 total_time = time.time() - start_time
@@ -1922,6 +2713,129 @@ async def realtime_streaming_mjpeg(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/realtime/init")
+async def init_realtime_session(
+    image: UploadFile = File(...), 
+    crop: bool = Form(True)
+):
+    """
+    Initialize a real-time low-latency streaming session.
+    Upload image once, then connect via WebSocket.
+    """
+    try:
+        if agent is None:
+            raise HTTPException(status_code=503, detail="Models not loaded")
+            
+        session_id = str(uuid.uuid4())
+        
+        # Load image
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            img_path = tmp.name
+            shutil.copyfileobj(image.file, tmp)
+            
+        img_pil = Image.open(img_path).convert('RGB')
+        
+        # Create session but don't start loop yet
+        # We need to wire output callback during WS connection
+        session = RealtimeSession(
+            session_id=session_id,
+            inference_agent=agent,
+            img_pil=img_pil,
+            crop=crop,
+            output_callback=None
+        )
+        realtime_sessions[session_id] = session
+        
+        # Cleanup temp file
+        if os.path.exists(img_path):
+            os.remove(img_path)
+            
+        return {"session_id": session_id, "websocket_url": f"/ws/realtime/{session_id}"}
+        
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.websocket("/ws/realtime/{session_id}")
+async def realtime_ws(websocket: WebSocket, session_id: str):
+    await websocket.accept()
+    
+    if session_id not in realtime_sessions:
+        await websocket.close(code=4004, reason="Session not found")
+        return
+        
+    session = realtime_sessions[session_id]
+    loop = asyncio.get_event_loop()
+    
+    # Bridge callback to send to WS from thread
+    def bridge_callback(type, payload, timestamp):
+        try:
+            # Protocol: [1 byte type] [8 bytes TS] [4 bytes len] [payload]
+            # type: 0x01 audio, 0x02 video
+            type_byte = 0x01 if type == "audio" else 0x02
+            header = struct.pack(">BQ I", type_byte, timestamp, len(payload))
+            packet = header + payload
+            
+            # Fire and forget into asyncio loop
+            asyncio.run_coroutine_threadsafe(websocket.send_bytes(packet), loop)
+        except Exception as e:
+            print(f"Callback Error: {e}")
+
+    session.output_callback = bridge_callback
+    session.start()
+    
+    print(f"[WS] Session {session_id} connected")
+    
+    try:
+        while True:
+            # Protocol: [1 byte type] [8 bytes TS] [4 bytes len] [payload]
+            # Client sends Audio Only usually, or maybe control
+            # Let's assume client sends: [1 byte type] ...
+            
+            # Read header
+            header = await websocket.receive_bytes()
+             
+            # Minimal header check
+            if len(header) < 13:
+                 # Maybe it's a small control packet? Or fragmented?
+                 # For now assume full packet arrives or at least header
+                 if len(header) == 0: break
+                 continue
+                 
+            msg_type = header[0]
+            # timestamp = struct.unpack(">Q", header[1:9])[0] # Unused for now
+            input_len = struct.unpack(">I", header[9:13])[0]
+            
+            # If we received more than header, splitting might be needed if using receive_bytes()
+            # But receive_bytes returns one "frame".
+            # If the client sends binary frame correctly, 'header' variable contains the whole frame
+            # Let's assume the WebSocket frame IS the packet.
+            
+            payload = header[13:]
+            if len(payload) < input_len:
+                # This shouldn't happen if client sends frame as one WS message
+                # But if it does, we might need to read more.
+                pass
+            
+            if msg_type == 0x01: # Audio
+                # Payload is PCM 16-bit 16kHz
+                audio_np = np.frombuffer(payload, dtype=np.int16)
+                session.push_audio(audio_np)
+                
+    except Exception as e:
+        print(f"[WS] Error or Disconnect: {e}")
+        # traceback.print_exc()
+    finally:
+        print(f"[WS] Session {session_id} closing")
+        session.stop()
+        if session_id in realtime_sessions:
+            del realtime_sessions[session_id]
+        try:
+            await websocket.close()
+        except:
+            pass
+            
+
 if __name__ == "__main__":
     import argparse
     
@@ -1938,3 +2852,4 @@ if __name__ == "__main__":
         port=args.port,
         reload=args.reload
     )
+

@@ -102,7 +102,7 @@ class FMGenerator(nn.Module):
         return tensor
 
     @torch.no_grad()
-    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None):
+    def sample(self, data, a_cfg_scale=1.0, nfe=10, seed=None, prev_context=None):
         a, ref_x = data['a'], data['ref_x']
         gaze_raw = data.get('gaze')
         pose_raw = data.get('pose')
@@ -143,6 +143,9 @@ class FMGenerator(nn.Module):
         sample = []
         num_chunks = int(math.ceil(T / self.num_frames_for_clip))
 
+        # Initial state from prev_context if provided
+        last_state = prev_context if prev_context is not None else {}
+
         for t in range(num_chunks):
             # Setup Initial Noise
             if self.opt.fix_noise_seed:
@@ -155,11 +158,18 @@ class FMGenerator(nn.Module):
 
             # Setup Previous Context
             if t == 0:
-                prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
-                prev_a_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
-                prev_gaze_t = torch.zeros(B, self.num_prev_frames, gaze.shape[-1], device=device)
-                prev_pose_t = torch.zeros(B, self.num_prev_frames, pose.shape[-1], device=device)
-                prev_cam_t = torch.zeros(B, self.num_prev_frames, cam.shape[-1], device=device)
+                if last_state:
+                    prev_x_t = last_state['prev_x']
+                    prev_a_t = last_state['prev_a']
+                    prev_gaze_t = last_state['prev_gaze']
+                    prev_pose_t = last_state['prev_pose']
+                    prev_cam_t = last_state['prev_cam']
+                else:
+                    prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_motion, device=device)
+                    prev_a_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
+                    prev_gaze_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
+                    prev_pose_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
+                    prev_cam_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_c, device=device)
             else:
                 prev_x_t = sample_t[:, -self.num_prev_frames:]
                 prev_a_t = a_t[:, -self.num_prev_frames:]
@@ -211,7 +221,17 @@ class FMGenerator(nn.Module):
             sample.append(sample_t)
 
         sample = torch.cat(sample, dim=1)[:, :T]
-        return sample
+        
+        # Prepare context for next chunk
+        new_context = {
+            'prev_x': sample[:, -self.num_prev_frames:],
+            'prev_a': a[:, -self.num_prev_frames:],
+            'prev_gaze': gaze[:, -self.num_prev_frames:],
+            'prev_pose': pose[:, -self.num_prev_frames:],
+            'prev_cam': cam[:, -self.num_prev_frames:],
+        }
+        
+        return sample, new_context
 
 
 class AudioEncoder(nn.Module):
@@ -225,7 +245,7 @@ class AudioEncoder(nn.Module):
         self.num_frames_for_clip = int(opt.wav2vec_sec * self.fps)
         self.num_prev_frames = int(opt.num_prev_frames)
 
-        self.wav2vec2 = Wav2VecModel.from_pretrained(opt.wav2vec_model_path, local_files_only=True)
+        self.wav2vec2 = Wav2VecModel.from_pretrained(opt.wav2vec_model_path, local_files_only=True, attn_implementation="eager")
         self.wav2vec2.feature_extractor._freeze_parameters()
 
         for param in self.wav2vec2.parameters():

@@ -1,0 +1,87 @@
+diff --git a/app.py b/app.py
+index 31ae144..9f1522e 100755
+--- a/app.py
++++ b/app.py
+@@ -81,7 +81,7 @@ class AppConfig:
+         self.renderer_path = "./checkpoints/renderer.ckpt"
+         self.generator_path = "./checkpoints/generator.ckpt"
+         self.wav2vec_model_path = "./checkpoints/wav2vec2-base-960h"
+-        self.input_size = 512
++        self.input_size = 256
+         self.input_nc = 3
+         self.fps = 25.0
+         self.rank = "cuda" 
+diff --git a/generator/generate.py b/generator/generate.py
+index 11cdafc..28fabe0 100755
+--- a/generator/generate.py
++++ b/generator/generate.py
+@@ -40,7 +40,7 @@ class DataProcessor:
+         )
+ 
+         self.transform = transforms.Compose([
+-            transforms.Resize((512, 512)),
++            transforms.Resize((256, 256)),
+             transforms.ToTensor(),
+         ])
+ 
+diff --git a/renderer/dataset.py b/renderer/dataset.py
+index 7bc8c3d..31655ba 100755
+--- a/renderer/dataset.py
++++ b/renderer/dataset.py
+@@ -13,7 +13,7 @@ from torchvision import transforms
+ 
+ def create_eye_mouth_mask(
+     landmarks_68: np.ndarray,
+-    image_size: int = 512,
++    image_size: int = 48,
+     eye_erosion_iters: int = 1,
+     eye_dilate_iters: int = 1,
+     mouth_dilate_iters: int = 2
+@@ -91,9 +91,9 @@ class TFDataset(Dataset):
+         self.split = split
+         self.root_path = Path(root_dir)
+         
+-        # Define transform for 512x512 only
++        # Define transform for 256x256 only
+         self.transform = transforms.Compose([
+-            transforms.Resize((512, 512)),
++            transforms.Resize((256, 256)),
+             transforms.ToTensor()
+         ])
+ 
+@@ -156,7 +156,7 @@ class TFDataset(Dataset):
+         lmd_path = meta['lmd']
+     
+         # Read landmarks
+-        landmarks = self.read_landmark_info(lmd_path, pixel_scale=(512, 512))
++        landmarks = self.read_landmark_info(lmd_path, pixel_scale=(256, 256))
+     
+         # Align length
+         min_len = min(len(frame_paths), len(landmarks))
+@@ -171,8 +171,8 @@ class TFDataset(Dataset):
+         image_0 = Image.open(frame_paths[f_id0]).convert("RGB")
+         image_1 = Image.open(frame_paths[f_id1]).convert("RGB")
+         
+-        mask_eye_0, mask_mouth_0 = create_eye_mouth_mask(landmarks[f_id0], 512, 0, 2, 2)
+-        mask_eye_1, mask_mouth_1 = create_eye_mouth_mask(landmarks[f_id1], 512, 0, 2, 2)
++        mask_eye_0, mask_mouth_0 = create_eye_mouth_mask(landmarks[f_id0], 256, 0, 2, 2)
++        mask_eye_1, mask_mouth_1 = create_eye_mouth_mask(landmarks[f_id1], 256, 0, 2, 2)
+ 
+         # ------------------------------
+         # Negative sampling (from a different video)
+@@ -185,13 +185,13 @@ class TFDataset(Dataset):
+         neg_frame_paths = neg_meta['frames']
+         neg_lmd_path = neg_meta['lmd']
+ 
+-        neg_landmarks = self.read_landmark_info(neg_lmd_path, pixel_scale=(512, 512))
++        neg_landmarks = self.read_landmark_info(neg_lmd_path, pixel_scale=(256, 256))
+         neg_len = min(len(neg_frame_paths), len(neg_landmarks))
+         
+         if neg_len > 0:
+             neg_frame_id = np.random.randint(neg_len)
+             neg_image = Image.open(neg_frame_paths[neg_frame_id]).convert("RGB")
+-            neg_mask_eye, neg_mask_mouth = create_eye_mouth_mask(neg_landmarks[neg_frame_id], 512, 0, 2, 2)
++            neg_mask_eye, neg_mask_mouth = create_eye_mouth_mask(neg_landmarks[neg_frame_id], 256, 0, 2, 2)
+         else:
+             # Fallback if negative sample is invalid (rare)
+             neg_image = image_0
