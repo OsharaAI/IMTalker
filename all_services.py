@@ -36,6 +36,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
+import hashlib
+
+# Try importing torchaudio for GPU-accelerated resampling
+try:
+    import torchaudio
+    import torchaudio.functional as AF
+    _HAS_TORCHAUDIO = True
+except ImportError:
+    print("Warning: torchaudio not installed. Falling back to scipy for resampling.")
+    _HAS_TORCHAUDIO = False
 
 # Try importing librosa for audio resampling
 try:
@@ -111,9 +121,10 @@ async def lifespan(app: FastAPI):
     
     # Enable optimizations
     imtalker_cfg.use_batching = True
-    imtalker_cfg.batch_size = 15  # Increased from 10 for better throughput
+    imtalker_cfg.batch_size = 15  # Increased for faster batched rendering (safe on 48GB GPU)
     imtalker_cfg.use_fp16 = False  # Disabled: causes NaN/Inf in frames with this model
     imtalker_cfg.use_compile = True  # Enable torch.compile for optimized kernels
+    imtalker_cfg.low_latency_mode = True  # NFE 10→5 for 2x faster generation (real-time)
     
     app.state.imtalker_streamer = IMTalkerStreamer(imtalker_cfg, device=device)
     # Initialize InferenceAgent sharing the same models
@@ -124,6 +135,14 @@ async def lifespan(app: FastAPI):
     app.state.chunked_sessions = {}
     app.state.hls_sessions = {}
     app.state.realtime_sessions = {}
+    
+    # Single-session guard: only ONE WebRTC session at a time
+    app.state.active_webrtc_session = None  # session_id or None
+    app.state.active_session_meta = {}      # {session_id, status, conv_manager, video_track, audio_track, ...}
+    app.state._session_lock = asyncio.Lock()
+    
+    # Idle animation cache (keyed by avatar image hash)
+    app.state.idle_cache = {}
     
     yield
     # Clean up models if necessary
@@ -163,12 +182,24 @@ async def root():
 @app.get("/health")
 async def health():
     """Detailed health check."""
+    stats = gpu_monitor.get_stats()
     return {
         "status": "healthy" if hasattr(app.state, 'imtalker_streamer') else "unhealthy",
         "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "cpu",
         "cuda_available": torch.cuda.is_available(),
-        "models_loaded": hasattr(app.state, 'imtalker_streamer')
+        "models_loaded": hasattr(app.state, 'imtalker_streamer'),
+        "gpu_memory": stats,
     }
+
+@app.get("/gpu_stats")
+async def gpu_stats():
+    """GPU memory monitoring endpoint for production dashboards.
+    
+    Returns current/peak memory usage, OOM count, and fallback status.
+    """
+    stats = gpu_monitor.get_stats()
+    stats["level"] = gpu_monitor.check_and_log("api-check")
+    return stats
 
 def numpy_to_wav_base64(audio_np, sampling_rate=16000):
     if isinstance(audio_np, torch.Tensor):
@@ -222,13 +253,13 @@ async def download_url_to_temp(url, prefix="download_", suffix=".tmp"):
         logger.error(f"Error downloading URL {url}: {e}")
         return None
 
-def split_text_semantically(text, min_chunk_length=50, max_chunk_length=200):
+def split_text_semantically(text, min_chunk_length=30, max_chunk_length=300):
     """Split text into semantic chunks (sentences/clauses) for more natural speech.
     
     Args:
         text: Input text to split
         min_chunk_length: Minimum characters per chunk
-        max_chunk_length: Maximum characters per chunk
+        max_chunk_length: Maximum characters per chunk (larger = fewer TTS calls = faster)
     
     Returns:
         List of text chunks
@@ -295,18 +326,58 @@ def parse_chunk_labels(text):
     # Remove empty strings and strip whitespace (including newlines)
     chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
     
-    # Debug: Log the parsed chunks to verify labels are removed
+    # If chunk labels were found, merge them into large groups for efficient TTS
     if len(chunks) > 1:
-        print(f"CM: Successfully parsed {len(chunks)} labeled chunks (labels removed)")
-        for i, chunk in enumerate(chunks, 1):
-            print(f"  Chunk {i}: '{chunk[:60]}...'")
+        print(f"CM: Parsed {len(chunks)} labeled chunks, merging into large groups...")
+        chunks = merge_into_large_groups(chunks)
     
-    # If no chunk labels found, fall back to semantic splitting
+    # If no chunk labels found, fall back to semantic splitting (already uses large chunks)
     if len(chunks) <= 1:
-        print("CM: No chunk labels found, using semantic splitting")
-        return split_text_semantically(text)
+        if len(chunks) == 1 and len(chunks[0]) > 300:
+            # Large text without labels — split semantically
+            print("CM: Large text, using semantic splitting")
+            return split_text_semantically(text)
+        elif not chunks:
+            print("CM: No chunk labels found, using semantic splitting")
+            return split_text_semantically(text)
     
     return chunks
+
+
+def merge_into_large_groups(chunks, target_chars=300):
+    """Merge small text chunks into larger groups for fewer, faster TTS calls.
+    
+    Instead of 8 × 50-char TTS calls (each with ~200ms overhead),
+    produces 2 × 200-char calls — much faster total.
+    
+    Args:
+        chunks: List of small text chunks
+        target_chars: Target characters per merged group (~10s of speech)
+    
+    Returns:
+        List of merged text chunks
+    """
+    if not chunks:
+        return chunks
+    
+    merged = []
+    current = ""
+    
+    for chunk in chunks:
+        if current and len(current) + len(chunk) + 1 > target_chars:
+            merged.append(current.strip())
+            current = chunk
+        else:
+            current = (current + " " + chunk).strip() if current else chunk
+    
+    if current:
+        merged.append(current.strip())
+    
+    print(f"CM: Merged {len(chunks)} small chunks → {len(merged)} large groups")
+    for i, g in enumerate(merged, 1):
+        print(f"  Group {i} ({len(g)} chars): '{g[:60]}...'")
+    
+    return merged
 
 # ============================================================================
 # REAL-TIME CHUNKED AUDIO STREAMING
@@ -934,39 +1005,252 @@ class DataProcessor:
         os.system(cmd)
 
 
+# ============================================================================
+# GPU MEMORY MONITOR WITH AUTO-FALLBACK
+# ============================================================================
+
+class GPUMemoryMonitor:
+    """Monitors GPU memory and provides auto-fallback for parallel rendering.
+    
+    Tracks peak usage, logs warnings at thresholds, and can dynamically
+    reduce worker count to prevent OOM errors.
+    """
+    
+    # Thresholds (fraction of total GPU memory)
+    WARN_THRESHOLD = 0.75     # Log warning at 75%
+    CRITICAL_THRESHOLD = 0.85 # Reduce workers at 85%
+    EMERGENCY_THRESHOLD = 0.92 # Force single worker + cache clear at 92%
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._peak_allocated_mb = 0.0
+        self._peak_reserved_mb = 0.0
+        self._oom_count = 0
+        self._fallback_active = False
+        self._last_log_time = 0
+        self._log_interval = 5.0  # Log at most every 5 seconds
+        self._total_mb = 0.0
+        
+        if torch.cuda.is_available():
+            self._total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+            print(f"[GPU Monitor] Total VRAM: {self._total_mb:.0f}MB")
+    
+    def snapshot(self) -> dict:
+        """Take a memory snapshot. Returns dict with MB values."""
+        if not torch.cuda.is_available():
+            return {"allocated_mb": 0, "reserved_mb": 0, "total_mb": 0, "pct": 0}
+        
+        allocated = torch.cuda.memory_allocated(0) / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved(0) / (1024 ** 2)
+        pct = allocated / self._total_mb if self._total_mb > 0 else 0
+        
+        with self._lock:
+            self._peak_allocated_mb = max(self._peak_allocated_mb, allocated)
+            self._peak_reserved_mb = max(self._peak_reserved_mb, reserved)
+        
+        return {
+            "allocated_mb": round(allocated, 1),
+            "reserved_mb": round(reserved, 1),
+            "total_mb": round(self._total_mb, 1),
+            "pct": round(pct, 4),
+        }
+    
+    def check_and_log(self, context: str = "") -> str:
+        """Check memory level and log if threshold exceeded.
+        
+        Returns:
+            'ok', 'warn', 'critical', or 'emergency'
+        """
+        snap = self.snapshot()
+        pct = snap["pct"]
+        level = "ok"
+        
+        if pct >= self.EMERGENCY_THRESHOLD:
+            level = "emergency"
+        elif pct >= self.CRITICAL_THRESHOLD:
+            level = "critical"
+        elif pct >= self.WARN_THRESHOLD:
+            level = "warn"
+        
+        now = time.time()
+        if level != "ok" and (now - self._last_log_time) > self._log_interval:
+            self._last_log_time = now
+            prefix = context + " " if context else ""
+            print(f"⚠️  [GPU Monitor] {prefix}{level.upper()}: "
+                  f"{snap['allocated_mb']:.0f}MB / {snap['total_mb']:.0f}MB "
+                  f"({pct*100:.1f}%) [peak: {self._peak_allocated_mb:.0f}MB]")
+        
+        return level
+    
+    def get_safe_workers(self, requested_workers: int) -> int:
+        """Return safe worker count based on current memory pressure.
+        
+        Auto-falls back to fewer workers under memory pressure.
+        """
+        level = self.check_and_log("worker-check")
+        
+        if level == "emergency":
+            if not self._fallback_active:
+                print("🚨 [GPU Monitor] EMERGENCY: Forcing 1 worker + clearing cache")
+                self._fallback_active = True
+                torch.cuda.empty_cache()
+            return 1
+        elif level == "critical":
+            if requested_workers > 1:
+                print(f"⚠️  [GPU Monitor] CRITICAL: Reducing workers {requested_workers} → 1")
+                self._fallback_active = True
+            return 1
+        else:
+            if self._fallback_active:
+                print("✅ [GPU Monitor] Memory pressure eased, restoring requested workers")
+                self._fallback_active = False
+            return requested_workers
+    
+    def record_oom(self):
+        """Record an OOM event for tracking."""
+        with self._lock:
+            self._oom_count += 1
+        snap = self.snapshot()
+        print(f"🚨 [GPU Monitor] OOM #{self._oom_count}! "
+              f"{snap['allocated_mb']:.0f}MB / {snap['total_mb']:.0f}MB")
+    
+    def get_stats(self) -> dict:
+        """Return monitoring statistics."""
+        snap = self.snapshot()
+        with self._lock:
+            return {
+                **snap,
+                "peak_allocated_mb": round(self._peak_allocated_mb, 1),
+                "peak_reserved_mb": round(self._peak_reserved_mb, 1),
+                "oom_count": self._oom_count,
+                "fallback_active": self._fallback_active,
+            }
+
+# Global GPU memory monitor instance
+gpu_monitor = GPUMemoryMonitor()
+
+
 class ParallelRenderer:
-    def __init__(self, agent, num_workers: int = 1, chunk_size: int = 5):
+    def __init__(self, agent, num_workers: int = 2, chunk_size: int = 3):
         self.agent = agent
         self.num_workers = num_workers
         self.chunk_size = chunk_size
         self.lock = threading.Lock()
+        self.render_batch_size = 3  # Frames per batch within each worker
+        print(f"[ParallelRenderer] workers={num_workers}, chunk_size={chunk_size}, "
+              f"render_batch={self.render_batch_size}")
     
+    def _get_effective_workers(self):
+        """Get worker count adjusted for memory pressure."""
+        return gpu_monitor.get_safe_workers(self.num_workers)
+
     def render_chunk(self, chunk_id, start_idx, end_idx, sample, g_r, m_r, f_r):
         try:
             frames = []
+            gpu_monitor.check_and_log(f"render-chunk-{chunk_id}")
             for t in range(start_idx, end_idx):
                 ta_c = self.agent.renderer.adapt(sample[:, t, ...], g_r)
                 m_c = self.agent.renderer.latent_token_decoder(ta_c)
                 out_frame = self.agent.renderer.decode(m_c, m_r, f_r)
                 frames.append(out_frame.cpu())
+                del ta_c, m_c, out_frame  # Explicit cleanup
+            return (chunk_id, frames, None)
+        except torch.cuda.OutOfMemoryError:
+            gpu_monitor.record_oom()
+            torch.cuda.empty_cache()
+            # Retry one frame at a time with cache clearing
+            frames = []
+            for t in range(start_idx, end_idx):
+                torch.cuda.empty_cache()
+                ta_c = self.agent.renderer.adapt(sample[:, t, ...], g_r)
+                m_c = self.agent.renderer.latent_token_decoder(ta_c)
+                out_frame = self.agent.renderer.decode(m_c, m_r, f_r)
+                frames.append(out_frame.cpu())
+                del ta_c, m_c, out_frame
             return (chunk_id, frames, None)
         except Exception as e:
             return (chunk_id, None, traceback.format_exc())
 
     def render_chunk_to_numpy(self, chunk_id, start_idx, end_idx, sample, g_r, m_r, f_r):
+        """Render chunk with batched processing and explicit memory cleanup."""
         try:
             frames = []
+            gpu_monitor.check_and_log(f"numpy-chunk-{chunk_id}")
+            
+            # Batched rendering within each chunk for throughput
+            batch_size = self.render_batch_size
+            for b_start in range(start_idx, end_idx, batch_size):
+                b_end = min(b_start + batch_size, end_idx)
+                curr_batch = b_end - b_start
+                
+                if curr_batch > 1:
+                    # Batch process multiple frames together
+                    try:
+                        sample_batch = sample[:, b_start:b_end, ...].squeeze(0)  # [batch, D]
+                        g_r_batch = g_r.repeat(curr_batch, 1)
+                        m_r_batch = tuple(m.repeat(curr_batch, 1, 1, 1) for m in m_r)
+                        f_r_batch = [f.repeat(curr_batch, 1, 1, 1) for f in f_r]
+                        
+                        ta_c_batch = self.agent.renderer.adapt(sample_batch, g_r_batch)
+                        m_c_batch = self.agent.renderer.latent_token_decoder(ta_c_batch)
+                        out_batch = self.agent.renderer.decode(m_c_batch, m_r_batch, f_r_batch)
+                        
+                        for f_idx in range(curr_batch):
+                            frame_np = out_batch[f_idx:f_idx+1].squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                            if frame_np.min() < 0:
+                                frame_np = (frame_np + 1) / 2
+                            frame_np = np.clip(frame_np, 0, 1)
+                            frame_np = (frame_np * 255).astype(np.uint8)
+                            frames.append(frame_np)
+                        
+                        del sample_batch, g_r_batch, m_r_batch, f_r_batch
+                        del ta_c_batch, m_c_batch, out_batch
+                    except (torch.cuda.OutOfMemoryError, RuntimeError):
+                        # Fallback to sequential if batch OOMs
+                        gpu_monitor.record_oom()
+                        torch.cuda.empty_cache()
+                        for t in range(b_start, b_end):
+                            ta_c = self.agent.renderer.adapt(sample[:, t, ...], g_r)
+                            m_c = self.agent.renderer.latent_token_decoder(ta_c)
+                            out_frame = self.agent.renderer.decode(m_c, m_r, f_r)
+                            frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                            if frame_np.min() < 0:
+                                frame_np = (frame_np + 1) / 2
+                            frame_np = np.clip(frame_np, 0, 1)
+                            frame_np = (frame_np * 255).astype(np.uint8)
+                            frames.append(frame_np)
+                            del ta_c, m_c, out_frame
+                else:
+                    # Single frame — sequential
+                    ta_c = self.agent.renderer.adapt(sample[:, b_start, ...], g_r)
+                    m_c = self.agent.renderer.latent_token_decoder(ta_c)
+                    out_frame = self.agent.renderer.decode(m_c, m_r, f_r)
+                    frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                    if frame_np.min() < 0:
+                        frame_np = (frame_np + 1) / 2
+                    frame_np = np.clip(frame_np, 0, 1)
+                    frame_np = (frame_np * 255).astype(np.uint8)
+                    frames.append(frame_np)
+                    del ta_c, m_c, out_frame
+            
+            return (chunk_id, frames, None)
+        except torch.cuda.OutOfMemoryError:
+            gpu_monitor.record_oom()
+            torch.cuda.empty_cache()
+            # Full fallback: sequential one-at-a-time
+            frames = []
             for t in range(start_idx, end_idx):
+                torch.cuda.empty_cache()
                 ta_c = self.agent.renderer.adapt(sample[:, t, ...], g_r)
                 m_c = self.agent.renderer.latent_token_decoder(ta_c)
                 out_frame = self.agent.renderer.decode(m_c, m_r, f_r)
-                
                 frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
                 if frame_np.min() < 0:
                     frame_np = (frame_np + 1) / 2
                 frame_np = np.clip(frame_np, 0, 1)
                 frame_np = (frame_np * 255).astype(np.uint8)
                 frames.append(frame_np)
+                del ta_c, m_c, out_frame
             return (chunk_id, frames, None)
         except Exception as e:
             return (chunk_id, None, traceback.format_exc())
@@ -975,8 +1259,9 @@ class ParallelRenderer:
         T = sample.shape[1]
         chunks = [(i // self.chunk_size, i, min(i + self.chunk_size, T)) for i in range(0, T, self.chunk_size)]
         rendered_chunks = {}
+        effective_workers = self._get_effective_workers()
         
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_to_chunk = {
                 executor.submit(self.render_chunk, cid, s, e, sample, g_r, m_r, f_r): cid
                 for cid, s, e in chunks
@@ -998,8 +1283,9 @@ class ParallelRenderer:
         chunks = [(i // self.chunk_size, i, min(i + self.chunk_size, T)) for i in range(0, T, self.chunk_size)]
         rendered_chunks = {}
         next_to_send = 0
+        effective_workers = self._get_effective_workers()
         
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_to_chunk = {
                 executor.submit(self.render_chunk_to_numpy, cid, s, e, sample, g_r, m_r, f_r): cid
                 for cid, s, e in chunks
@@ -1021,8 +1307,9 @@ class ParallelRenderer:
         rendered_chunks = {}
         next_to_yield = 0
         render_func = self.render_chunk_to_numpy if output_format == "numpy" else self.render_chunk
+        effective_workers = self._get_effective_workers()
         
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
             future_to_chunk = {
                 executor.submit(render_func, cid, s, e, sample, g_r, m_r, f_r): cid
                 for cid, s, e in chunks
@@ -1061,10 +1348,10 @@ class InferenceAgent:
         
         self.parallel_renderer = ParallelRenderer(
             agent=self,
-            num_workers=getattr(opt, 'num_render_workers', 1),
-            chunk_size=getattr(opt, 'render_chunk_size', 5)
+            num_workers=getattr(opt, 'num_render_workers', 2),
+            chunk_size=getattr(opt, 'render_chunk_size', 3)
         )
-        print("InferenceAgent ready.")
+        print(f"InferenceAgent ready. GPU: {gpu_monitor.snapshot()['allocated_mb']:.0f}MB / {gpu_monitor.snapshot()['total_mb']:.0f}MB")
 
     def _load_ckpt(self, model, path, prefix="gen."):
         if not os.path.exists(path): return
@@ -1118,7 +1405,7 @@ class InferenceAgent:
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
         
-        T = math.ceil(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+        T = round(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
         data = {"s": s_tensor, "a": a_tensor, "pose": None, "cam": None, "gaze": None, "ref_x": None}
         
         if pose_style:
@@ -1185,7 +1472,7 @@ class InferenceAgent:
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
         
-        T = math.ceil(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+        T = round(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
         data = {"s": s_tensor, "a": a_tensor, "pose": None, "cam": None, "gaze": None, "ref_x": None}
         if pose_style: data["pose"] = torch.tensor(pose_style).unsqueeze(0).unsqueeze(0).expand(1, T, 3).to(self.device)
         if gaze_style: data["gaze"] = torch.tensor(gaze_style).unsqueeze(0).unsqueeze(0).expand(1, T, 2).to(self.device)
@@ -1251,7 +1538,7 @@ class InferenceAgent:
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = torch.from_numpy(audio_chunk_np).float().unsqueeze(0).to(self.device)
         
-        T = math.ceil(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+        T = round(a_tensor.shape[-1] * self.opt.fps / self.opt.sampling_rate)
         data = {"s": s_tensor, "a": a_tensor, "pose": None, "cam": None, "gaze": None, "ref_x": None}
         if pose_style: data["pose"] = torch.tensor(pose_style).unsqueeze(0).unsqueeze(0).expand(1, T, 3).to(self.device)
         if gaze_style: data["gaze"] = torch.tensor(gaze_style).unsqueeze(0).unsqueeze(0).expand(1, T, 2).to(self.device)
@@ -1285,13 +1572,14 @@ class InferenceAgent:
 # --- Conversation Manager ---
 
 class ConversationManager:
-    def __init__(self, openai_client, tts_model, imtalker_streamer, video_track, audio_track, avatar_img, system_prompt=None, reference_audio=None):
+    def __init__(self, openai_client, tts_model, imtalker_streamer, video_track, audio_track, avatar_img, system_prompt=None, reference_audio=None, sync_manager=None):
         self.openai_client = openai_client
         self.tts_model = tts_model
         self.imtalker_streamer = imtalker_streamer
         self.video_track = video_track
         self.audio_track = audio_track
         self.avatar_img = avatar_img
+        self.sync_manager = sync_manager
         
         # Use deque for efficient appends (ring buffer)
         self.audio_buffer = collections.deque()  # Buffer for current spoken segment
@@ -1303,7 +1591,7 @@ class ConversationManager:
         
         # Frame interpolation settings
         self.enable_frame_blending = True  # Smooth transitions between chunks
-        self.blend_steps = 2  # Number of interpolated frames (alpha: 0.33, 0.66)
+        self.blend_steps = 1  # Single interpolated frame (lighter for real-time)
         self.last_chunk_final_frame = None  # Track last frame for blending
         
         # Pipeline parallelization settings
@@ -1314,26 +1602,53 @@ class ConversationManager:
         
         self.is_speaking = False # State of AI response
         self.user_is_talking = False # State of user speech detection
-        chunk_prompt = """IMPORTANT: Format your response using semantic chunks with labels like this:
-chunk1: First sentence or thought.
-chunk2: Second sentence or thought.
-chunk3: Third sentence or thought.
-...chunkN: Nth sentence or thought.
-
-Each chunk should be a complete sentence or related group of sentences (30-150 characters). This helps create natural pauses in speech."""
-        self.system_prompt = system_prompt+chunk_prompt if system_prompt else """You are a friendly and helpful AI assistant avatar. 
+        # Simpler prompt — no need for chunk labels, we handle chunking ourselves
+        default_prompt = """You are a friendly and helpful AI assistant avatar. 
 Keep your answers brief and engaging, suitable for a voice conversation.
-""" + chunk_prompt  
+Respond naturally in 2-4 sentences."""
+        self.system_prompt = system_prompt if system_prompt else default_prompt
         self.reference_audio = reference_audio
         
-        # VAD parameters
-        self.start_threshold = 0.018 # Slightly higher to avoid static
-        self.stop_threshold = 0.012  # Higher to ignore background hum
-        self.silence_duration = 0.7 # Shorter for snappier feel
+        # VAD parameters (tuned for snappy conversation)
+        self.start_threshold = 0.012 # Lowered to catch quieter speech
+        self.stop_threshold = 0.008  # Lowered to detect natural pauses
+        self.silence_duration = 0.5  # 500ms for faster turn-taking
         
         self.last_speech_time = time.time()
         self._processing_task = None
         self._loop = asyncio.get_event_loop()
+
+    def cleanup(self):
+        """Release all resources held by this ConversationManager."""
+        print("CM: Cleaning up resources...")
+        self.is_speaking = False
+        self.user_is_talking = False
+        
+        # Shutdown thread pool executors
+        try:
+            self.tts_executor.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self.render_executor.shutdown(wait=False)
+        except Exception:
+            pass
+        
+        # Clear audio buffer
+        self.audio_buffer.clear()
+        self.preroll_buffer.clear()
+        
+        # Clear references to tracks/models (don't delete — shared)
+        self.video_track = None
+        self.audio_track = None
+        self.avatar_img = None
+        self.last_chunk_final_frame = None
+        
+        # Cancel any pending processing task
+        if self._processing_task and not self._processing_task.done():
+            self._processing_task.cancel()
+        
+        print("CM: Cleanup complete.")
 
     async def add_microphone_audio(self, audio_np, sample_rate):
         """Called when new audio comes from WebRTC microphone"""
@@ -1480,9 +1795,11 @@ Keep your answers brief and engaging, suitable for a voice conversation.
             print(f"⏱️  Audio encoding: {time.time() - t_encode:.3f}s")
 
             t_openai = time.time()
-            response = await self.openai_client.chat.completions.create(
+            # Use streaming + gpt-4o-audio-preview for faster response with audio input support
+            stream = await self.openai_client.chat.completions.create(
                 model="gpt-4o-audio-preview",
                 modalities=["text"],
+                stream=True,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
                     {
@@ -1496,9 +1813,14 @@ Keep your answers brief and engaging, suitable for a voice conversation.
                     },
                 ],
             )
-            openai_time = time.time() - t_openai
             
-            text_response = response.choices[0].message.content
+            # Accumulate streamed response
+            text_response = ""
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    text_response += chunk.choices[0].delta.content
+            
+            openai_time = time.time() - t_openai
             print(f"⏱️  OpenAI response: {openai_time:.3f}s")
             print(f"CM: Assistant response from OpenAI: {text_response}")
             
@@ -1514,169 +1836,257 @@ Keep your answers brief and engaging, suitable for a voice conversation.
             traceback.print_exc()
 
     async def generate_and_feed(self, text):
+        """Real-time streaming pipeline with LOCKED audio-video synchronization.
+        
+        Architecture:
+          Stage 1 (audio_chunker): TTS text → audio tensors (CPU)
+          Stage 2 (renderer): audio → paired (video_frame, audio_slice) items
+          Stage 3 (av_streamer): pushes paired A/V to WebRTC tracks in LOCKSTEP
+        
+        The key insight: audio and video are NEVER pushed separately.
+        Each item in av_queue is (video_frame, audio_samples_for_that_frame).
+        av_streamer pushes both to their tracks at the SAME wall-clock instant,
+        so WebRTC timestamps stay aligned regardless of rendering speed.
+        """
         print(f"CM: Generating response: {text[:50]}{'...' if len(text) > 50 else ''}")
         self.is_speaking = True
         
-        # Parse chunk labels from OpenAI response (or fall back to semantic splitting)
         t_parse = time.time()
         text_chunks = parse_chunk_labels(text)
         print(f"⏱️  Chunk parsing: {time.time() - t_parse:.3f}s → {len(text_chunks)} chunks")
         
-        # Pipeline queues
-        audio_chunks_queue = asyncio.Queue(maxsize=3)
-        video_chunks_queue = asyncio.Queue(maxsize=2)
+        # TTS output queue
+        audio_chunks_queue = asyncio.Queue(maxsize=4)
+        # PAIRED A/V queue: each item is (VideoFrame, np.ndarray_audio_int16_slice) or None
+        av_queue = asyncio.Queue(maxsize=30)
+        
+        SAMPLES_PER_FRAME = 960  # 24000 Hz / 25 FPS = 960 audio samples per video frame
         
         try:
-            # Stage 1: Semantic Audio Chunking
+            # Stage 1: TTS — generate audio for each text chunk
+            # Uses large merged chunks (~300 chars ≈ ~10s speech) for fewer TTS calls
             async def audio_chunker():
-                print("CM: Stage 1 - Semantic audio chunking started")
                 tts_total_time = 0
-                
                 for chunk_idx, text_chunk in enumerate(text_chunks, 1):
-                    print(f"CM: Stage 1 - Processing chunk {chunk_idx}/{len(text_chunks)}: '{text_chunk[:60]}...'")
-                    
-                    # Generate TTS for this semantic chunk (WITHOUT labels)
                     t_tts = time.time()
                     tts_stream = self.tts_model.generate_stream(
                         text=text_chunk,
-                        chunk_size=20,
+                        chunk_size=50,
                         print_metrics=False,
                         audio_prompt_path=self.reference_audio
                     )
-                    
-                    # Accumulate all audio for this text chunk
                     audio_parts = []
                     for audio_chunk, metrics in tts_stream:
-                        audio_parts.append(audio_chunk)
+                        audio_parts.append(audio_chunk.cpu() if isinstance(audio_chunk, torch.Tensor) else audio_chunk)
                     
                     tts_chunk_time = time.time() - t_tts
                     tts_total_time += tts_chunk_time
                     
-                    # Concatenate all audio for this semantic chunk
                     if audio_parts:
                         full_audio = torch.cat(audio_parts, dim=-1)
-                        queue_depth = audio_chunks_queue.qsize()
-                        if queue_depth >= 2:
-                            print(f"CM: Stage 1 - ⚠️  Audio queue backpressure ({queue_depth}/3)")
-                        await audio_chunks_queue.put((full_audio, text_chunk))
-                        duration = full_audio.shape[-1] / 24000
-                        print(f"⏱️  TTS chunk {chunk_idx}: {tts_chunk_time:.3f}s → {duration:.1f}s audio")
+                        del audio_parts
+                        # Convert to numpy immediately to free torch allocator
+                        audio_np = full_audio.numpy().flatten().copy()  # .copy() ensures owns memory
+                        duration = len(audio_np) / 24000
+                        del full_audio
+                        await audio_chunks_queue.put((audio_np, text_chunk, chunk_idx))
+                        print(f"⏱️  TTS chunk {chunk_idx}/{len(text_chunks)}: {tts_chunk_time:.3f}s → {duration:.1f}s audio")
+                    else:
+                        del audio_parts
                 
-                # Signal end of audio
                 await audio_chunks_queue.put(None)
                 print(f"⏱️  TTS total: {tts_total_time:.3f}s for {len(text_chunks)} chunks")
             
-            # Stage 2: Video Rendering
-            async def video_renderer():
-                print("CM: Stage 2 - Video renderer started")
-                chunk_idx = 0
+            # Stage 2: Render → stream paired (frame, audio_slice) into av_queue
+            async def renderer():
                 render_total_time = 0
                 
                 while True:
                     item = await audio_chunks_queue.get()
                     if item is None:
-                        await video_chunks_queue.put(None)
+                        await av_queue.put(None)
                         break
                     
-                    audio_chunk, text_chunk = item
-                    chunk_idx += 1
-                    chunk_duration = audio_chunk.shape[-1] / 24000  # Chatterbox uses 24kHz
-                    print(f"CM: Stage 2 - Rendering semantic chunk {chunk_idx} ({chunk_duration:.1f}s): '{text_chunk[:30]}...'")
+                    audio_24k_np, text_chunk, chunk_idx = item
+                    total_audio_samples = len(audio_24k_np)
+                    chunk_duration = total_audio_samples / 24000
                     
-                    # Render in thread pool
+                    print(f"CM: Rendering chunk {chunk_idx} ({chunk_duration:.1f}s): '{text_chunk[:40]}...'")
                     t_render = time.time()
-                    def render():
-                        frames = []
-                        # Create a simple audio iterator for this chunk
-                        def audio_iter():
-                            yield audio_chunk
+                    
+                    def render_and_stream():
+                        """Render video and push pairs DIRECTLY to av_queue as they're generated.
                         
-                        for video_frames, metrics in self.imtalker_streamer.generate_stream(self.avatar_img, audio_iter()):
-                            for frame_tensor in video_frames:
-                                frame_rgb = process_frame_tensor(frame_tensor, format="RGB")
+                        No accumulation — each pair is pushed immediately, keeping peak
+                        memory usage to ~1 batch of frames instead of ALL frames.
+                        """
+                        gpu_monitor.check_and_log(f"render-chunk-{chunk_idx}")
+                        
+                        # Resample 24kHz → 16kHz for wav2vec2 (entirely numpy, no torch tensor needed)
+                        if _HAS_TORCHAUDIO:
+                            at = torch.from_numpy(audio_24k_np).float().unsqueeze(0)
+                            audio_16k = AF.resample(at, 24000, 16000).squeeze(0).numpy()
+                            del at
+                        else:
+                            num_samples_16k = int(len(audio_24k_np) * 16000 / 24000)
+                            from scipy.signal import resample as scipy_resample
+                            audio_16k = scipy_resample(audio_24k_np, num_samples_16k).astype(np.float32)
+                        
+                        # Clip audio to [-1, 1] to prevent int16 overflow distortion
+                        peak = np.abs(audio_24k_np).max()
+                        if peak > 1.0:
+                            audio_24k_clipped = audio_24k_np / peak  # normalize
+                        else:
+                            audio_24k_clipped = audio_24k_np
+                        
+                        # Apply 5ms fade-out at the very end to prevent click/pop
+                        fade_samples = min(120, total_audio_samples // 4)  # 120 samples = 5ms at 24kHz
+                        if fade_samples > 0:
+                            fade = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+                            audio_24k_clipped[-fade_samples:] = audio_24k_clipped[-fade_samples:] * fade
+                        
+                        frame_count = 0
+                        audio_cursor = 0
+                        last_pair = None  # Only keep ref to LAST pair for remainder audio
+                        
+                        for video_frames, metrics in self.imtalker_streamer.generate_stream(
+                            self.avatar_img, iter([audio_16k])
+                        ):
+                            for ft in video_frames:
+                                # Convert frame tensor to VideoFrame
+                                frame_rgb = process_frame_tensor(ft, format="RGB")
                                 av_frame = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
-                                frames.append(av_frame)
+                                del ft, frame_rgb
+                                
+                                # Slice the corresponding audio for this frame
+                                audio_end = min(audio_cursor + SAMPLES_PER_FRAME, total_audio_samples)
+                                audio_slice = audio_24k_clipped[audio_cursor:audio_end].copy()
+                                audio_cursor = audio_end
+                                
+                                # Convert to int16 for WebRTC (already clipped to [-1,1])
+                                audio_slice_int16 = (audio_slice * 32767).astype(np.int16)
+                                del audio_slice
+                                
+                                pair = (av_frame, audio_slice_int16)
+                                
+                                # Push directly to av_queue (backpressure via maxsize=30)
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    av_queue.put(pair), self._loop
+                                )
+                                fut.result(timeout=10)
+                                frame_count += 1
+                                last_pair = pair
+                            del video_frames
                         
-                        # Clear CUDA cache after rendering to prevent OOM
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        # If any remaining audio (rounding), push as a tiny extra pair
+                        if audio_cursor < total_audio_samples and last_pair is not None:
+                            remainder = audio_24k_clipped[audio_cursor:].copy()
+                            remainder_int16 = (remainder * 32767).astype(np.int16)
+                            del remainder
+                            # Create a duplicate of the last video frame with remaining audio
+                            last_frame, _ = last_pair
+                            fut = asyncio.run_coroutine_threadsafe(
+                                av_queue.put((last_frame, remainder_int16)), self._loop
+                            )
+                            fut.result(timeout=10)
+                            frame_count += 1
                         
-                        return frames, metrics
+                        del audio_16k, last_pair, audio_24k_clipped
+                        
+                        return frame_count
                     
-                    frames, metrics = await self._loop.run_in_executor(None, render)
-                    render_chunk_time = time.time() - t_render
-                    render_total_time += render_chunk_time
+                    frame_count = await self._loop.run_in_executor(None, render_and_stream)
+                    render_time = time.time() - t_render
+                    render_total_time += render_time
+                    del audio_24k_np
                     
-                    # Package audio WITH video frames for synchronized playback
-                    queue_depth = video_chunks_queue.qsize()
-                    if queue_depth >= 1:
-                        print(f"CM: Stage 2 - ⚠️  Video queue backpressure ({queue_depth}/2)")
-                    await video_chunks_queue.put((frames, metrics, audio_chunk))
-                    print(f"⏱️  IMTalker render chunk {chunk_idx}: {render_chunk_time:.3f}s → {len(frames)} frames, RTF: {metrics['rtf']:.2f}")
+                    print(f"⏱️  Render chunk {chunk_idx}: {render_time:.3f}s → {frame_count} A/V pairs (streamed)")
                 
-                print(f"⏱️  IMTalker render total: {render_total_time:.3f}s for {chunk_idx} chunks")
+                print(f"⏱️  Render total: {render_total_time:.3f}s")
             
-            # Stage 3: Video Streaming (Synchronized A/V with Frame Blending)
-            async def video_streamer():
-                print("CM: Stage 3 - Video streamer started")
-                total_frames = 0
-                chunk_count = 0
+            # Stage 3: LOCKSTEP A/V streaming at 25 FPS
+            async def av_streamer():
+                """Push paired audio+video to WebRTC tracks simultaneously.
                 
-                # Helper function for frame blending
-                def blend_frames(frame1, frame2, alpha):
-                    """Alpha blend between two VideoFrame objects"""
-                    arr1 = frame1.to_ndarray(format="rgb24")
-                    arr2 = frame2.to_ndarray(format="rgb24")
-                    blended = (arr1 * (1 - alpha) + arr2 * alpha).astype(np.uint8)
-                    return VideoFrame.from_ndarray(blended, format="rgb24")
+                This is the ONLY place audio and video enter the tracks.
+                By pushing both from the same loop iteration, WebRTC assigns
+                them correlated PTS values and they stay in sync.
+                """
+                total_frames = 0
+                stream_start = None
                 
                 while True:
-                    item = await video_chunks_queue.get()
+                    item = await av_queue.get()
                     if item is None:
                         break
                     
-                    frames, metrics, audio_chunk = item
-                    chunk_count += 1
-                    print(f"CM: Stage 3 - Streaming chunk {chunk_count}: {len(frames)} frames")
+                    av_frame, audio_slice_int16 = item
                     
-                    # Feed audio to track first (it buffers internally)
-                    audio_np = audio_chunk.cpu().numpy().flatten()
-                    asyncio.run_coroutine_threadsafe(
-                        self.audio_track.add_audio(audio_np), 
-                        self._loop
-                    )
+                    if stream_start is None:
+                        stream_start = time.time()
+                        # CRITICAL: Tell video track we're speaking (no more idle frame insertion)
+                        self.video_track.start_speaking()
+                        # Reset audio clock so pacing starts NOW
+                        self.audio_track.reset_clock()
+                        print(f"CM: First A/V pair — tracks reset, lockstep streaming starts")
                     
-                    # Insert blended transition frames if enabled and we have a previous chunk
-                    if self.enable_frame_blending and self.last_chunk_final_frame is not None and len(frames) > 0:
-                        first_frame = frames[0]
-                        # Generate interpolated frames (alpha: 0.33, 0.66)
-                        for i in range(1, self.blend_steps + 1):
-                            alpha = i / (self.blend_steps + 1)  # 0.33, 0.66 for blend_steps=2
-                            blended = blend_frames(self.last_chunk_final_frame, first_frame, alpha)
-                            asyncio.run_coroutine_threadsafe(self.video_track.add_frame(blended), self._loop)
-                            await asyncio.sleep(0.04)  # 25 FPS
-                            total_frames += 1
-                        print(f"CM: Stage 3 - Inserted {self.blend_steps} blended transition frames")
+                    # Push BOTH audio and video at the same instant
+                    # Audio: split into 20ms WebRTC frames (480 samples at 24kHz)
+                    # Use put_nowait — queue is unbounded so this won't fail,
+                    # but if it ever does, we drop oldest to prevent blocking.
+                    frame_size = 480
+                    for i in range(0, len(audio_slice_int16), frame_size):
+                        chunk = audio_slice_int16[i:i + frame_size]
+                        if len(chunk) < frame_size:
+                            padded = np.zeros(frame_size, dtype=np.int16)
+                            padded[:len(chunk)] = chunk
+                            chunk = padded
+                        try:
+                            self.audio_track.audio_queue.put_nowait(chunk)
+                        except asyncio.QueueFull:
+                            # Drop oldest frame to make room (prevents blocking)
+                            try:
+                                self.audio_track.audio_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            self.audio_track.audio_queue.put_nowait(chunk)
                     
-                    # Stream the actual chunk frames
-                    for av_frame in frames:
-                        asyncio.run_coroutine_threadsafe(self.video_track.add_frame(av_frame), self._loop)
-                        # Pace at 25 FPS
+                    # Video: push frame directly to track queue
+                    await self.video_track.frame_queue.put(av_frame)
+                    
+                    total_frames += 1
+                    self.last_chunk_final_frame = av_frame
+                    
+                    if self.sync_manager:
+                        self.sync_manager.notify_video_content(1)
+                        self.sync_manager.notify_audio_content(len(audio_slice_int16))
+                    
+                    # Wall-clock aligned pacing at 25 FPS
+                    expected_time = stream_start + total_frames * 0.04
+                    now = time.time()
+                    sleep_time = expected_time - now
+                    if sleep_time > 0.002:
+                        await asyncio.sleep(sleep_time)
+                    elif sleep_time < -0.08:
+                        # More than 2 frames behind schedule (rendering gap).
+                        # DO NOT burst to catch up — that causes fast-forward.
+                        # Re-anchor pacing to NOW so we resume normal 25 FPS.
+                        stream_start = now - total_frames * 0.04
+                        # Pause one frame period so next iteration paces correctly
                         await asyncio.sleep(0.04)
-                    
-                    total_frames += len(frames)
-                    
-                    # Save last frame for next chunk blending
-                    if len(frames) > 0:
-                        self.last_chunk_final_frame = frames[-1]
                 
-                print(f"CM: Stage 3 - Video streaming finished ({total_frames} total frames)")
+                # Speech finished — resume idle animation
+                self.video_track.stop_speaking()
+                
+                elapsed = time.time() - stream_start if stream_start else 0
+                fps_actual = total_frames / elapsed if elapsed > 0 else 0
+                print(f"CM: Streamed {total_frames} A/V pairs in {elapsed:.2f}s ({fps_actual:.1f} FPS)")
             
             # Run all stages concurrently
             await asyncio.gather(
                 audio_chunker(),
-                video_renderer(),
-                video_streamer()
+                renderer(),
+                av_streamer()
             )
             
         except Exception as e:
@@ -1686,20 +2096,405 @@ Keep your answers brief and engaging, suitable for a voice conversation.
             print("CM: Resetting is_speaking to False")
             self.is_speaking = False
 
+    async def pre_render_to_buffer(self, text):
+        """Pre-render text to a list of (VideoFrame, audio_int16) pairs WITHOUT pushing to tracks.
+        
+        Used by /offer to pre-generate greeting content before returning the SDP answer,
+        so the frontend stays on 'connecting' screen while rendering happens.
+        Returns list of (VideoFrame, np.ndarray[int16]) pairs ready for push_buffered_greeting().
+        """
+        print(f"CM: Pre-rendering to buffer: {text[:50]}{'...' if len(text) > 50 else ''}")
+        t_start = time.time()
+        
+        SAMPLES_PER_FRAME = 960  # 24000 Hz / 25 FPS
+        buffer_pairs = []  # Collect all (VideoFrame, audio_int16) pairs
+        
+        # Stage 1: TTS — generate audio
+        text_chunks = parse_chunk_labels(text)
+        all_audio_chunks = []  # list of (audio_np, text_chunk, chunk_idx)
+        
+        for chunk_idx, text_chunk in enumerate(text_chunks, 1):
+            t_tts = time.time()
+            tts_stream = self.tts_model.generate_stream(
+                text=text_chunk,
+                chunk_size=50,
+                print_metrics=False,
+                audio_prompt_path=self.reference_audio
+            )
+            audio_parts = []
+            for audio_chunk, metrics in tts_stream:
+                audio_parts.append(audio_chunk.cpu() if isinstance(audio_chunk, torch.Tensor) else audio_chunk)
+            
+            if audio_parts:
+                full_audio = torch.cat(audio_parts, dim=-1)
+                del audio_parts
+                audio_np = full_audio.numpy().flatten().copy()
+                del full_audio
+                all_audio_chunks.append((audio_np, text_chunk, chunk_idx))
+                print(f"⏱️  Pre-render TTS chunk {chunk_idx}/{len(text_chunks)}: {time.time() - t_tts:.3f}s → {len(audio_np)/24000:.1f}s audio")
+            else:
+                del audio_parts
+        
+        
+        # Stage 2: Render — generate video frames paired with audio slices
+        for audio_24k_np, text_chunk, chunk_idx in all_audio_chunks:
+            total_audio_samples = len(audio_24k_np)
+            t_render = time.time()
+            
+            def render_to_list(audio_np=audio_24k_np, total_samples=total_audio_samples):
+                """Render video and collect pairs into a list (no queue push)."""
+                pairs = []
+                
+                if _HAS_TORCHAUDIO:
+                    at = torch.from_numpy(audio_np).float().unsqueeze(0)
+                    audio_16k = AF.resample(at, 24000, 16000).squeeze(0).numpy()
+                    del at
+                else:
+                    num_samples_16k = int(len(audio_np) * 16000 / 24000)
+                    from scipy.signal import resample as scipy_resample
+                    audio_16k = scipy_resample(audio_np, num_samples_16k).astype(np.float32)
+                
+                peak = np.abs(audio_np).max()
+                audio_24k_clipped = audio_np / peak if peak > 1.0 else audio_np
+                
+                fade_samples = min(120, total_samples // 4)
+                if fade_samples > 0:
+                    fade = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+                    audio_24k_clipped = audio_24k_clipped.copy()
+                    audio_24k_clipped[-fade_samples:] = audio_24k_clipped[-fade_samples:] * fade
+                
+                audio_cursor = 0
+                last_pair = None
+                
+                for video_frames, metrics in self.imtalker_streamer.generate_stream(
+                    self.avatar_img, iter([audio_16k])
+                ):
+                    for ft in video_frames:
+                        frame_rgb = process_frame_tensor(ft, format="RGB")
+                        av_frame = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
+                        del ft, frame_rgb
+                        
+                        audio_end = min(audio_cursor + SAMPLES_PER_FRAME, total_samples)
+                        audio_slice = audio_24k_clipped[audio_cursor:audio_end].copy()
+                        audio_cursor = audio_end
+                        audio_slice_int16 = (audio_slice * 32767).astype(np.int16)
+                        del audio_slice
+                        
+                        pair = (av_frame, audio_slice_int16)
+                        pairs.append(pair)
+                        last_pair = pair
+                    del video_frames
+                
+                if audio_cursor < total_samples and last_pair is not None:
+                    remainder = audio_24k_clipped[audio_cursor:].copy()
+                    remainder_int16 = (remainder * 32767).astype(np.int16)
+                    del remainder
+                    last_frame, _ = last_pair
+                    pairs.append((last_frame, remainder_int16))
+                
+                del audio_16k, last_pair, audio_24k_clipped
+                return pairs
+            
+            chunk_pairs = await self._loop.run_in_executor(None, render_to_list)
+            buffer_pairs.extend(chunk_pairs)
+            print(f"⏱️  Pre-render chunk {chunk_idx}: {time.time() - t_render:.3f}s → {len(chunk_pairs)} A/V pairs")
+            del audio_24k_np
+        
+        elapsed = time.time() - t_start
+        print(f"CM: Pre-rendered {len(buffer_pairs)} A/V pairs in {elapsed:.2f}s")
+        return buffer_pairs
+
+    async def push_buffered_greeting(self, pairs):
+        """Push pre-rendered A/V pairs through tracks with proper 25 FPS pacing.
+        
+        Called after WebRTC connection is established to play the pre-rendered greeting.
+        """
+        if not pairs:
+            return
+        
+        print(f"CM: Pushing {len(pairs)} pre-rendered A/V pairs...")
+        self.is_speaking = True
+        
+        # Tell video track we're speaking
+        self.video_track.start_speaking()
+        # Reset audio clock so pacing starts NOW
+        self.audio_track.reset_clock()
+        
+        stream_start = time.time()
+        total_frames = 0
+        
+        for av_frame, audio_slice_int16 in pairs:
+            # Push audio: split into 20ms WebRTC frames (480 samples at 24kHz)
+            frame_size = 480
+            for i in range(0, len(audio_slice_int16), frame_size):
+                chunk = audio_slice_int16[i:i + frame_size]
+                if len(chunk) < frame_size:
+                    padded = np.zeros(frame_size, dtype=np.int16)
+                    padded[:len(chunk)] = chunk
+                    chunk = padded
+                try:
+                    self.audio_track.audio_queue.put_nowait(chunk)
+                except asyncio.QueueFull:
+                    try:
+                        self.audio_track.audio_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    self.audio_track.audio_queue.put_nowait(chunk)
+            
+            # Push video frame
+            await self.video_track.frame_queue.put(av_frame)
+            
+            total_frames += 1
+            self.last_chunk_final_frame = av_frame
+            
+            # Wall-clock pacing at 25 FPS
+            expected_time = stream_start + total_frames * 0.04
+            now = time.time()
+            sleep_time = expected_time - now
+            if sleep_time > 0.002:
+                await asyncio.sleep(sleep_time)
+            elif sleep_time < -0.08:
+                stream_start = now - total_frames * 0.04
+                await asyncio.sleep(0.04)
+        
+        # Speech finished — resume idle
+        self.video_track.stop_speaking()
+        self.is_speaking = False
+        
+        elapsed = time.time() - stream_start
+        fps_actual = total_frames / elapsed if elapsed > 0 else 0
+        print(f"CM: Greeting pushed: {total_frames} A/V pairs in {elapsed:.2f}s ({fps_actual:.1f} FPS)")
+
+
+# --- A/V Sync Manager ---
+
+class AVSyncManager:
+    """Monitors audio-video content delivery drift for WebRTC streams.
+    
+    Tracks when real content (not silence/idle frames) is delivered to each track,
+    and logs warnings when content delivery times diverge. Does NOT manage PTS
+    (WebRTC's built-in next_timestamp() handles transport-level timing).
+    """
+    
+    def __init__(self, video_fps=25.0, audio_sample_rate=24000, drift_threshold_ms=100):
+        self.video_fps = video_fps
+        self.audio_sample_rate = audio_sample_rate
+        self.drift_threshold_ms = drift_threshold_ms
+        
+        # Track cumulative CONTENT duration delivered (not transport frames)
+        self._audio_content_s = 0.0  # seconds of real audio content delivered
+        self._video_content_s = 0.0  # seconds of real video content delivered
+        
+        self._lock = threading.Lock()
+        self._drift_history = collections.deque(maxlen=50)
+        self._last_drift_log_time = 0
+    
+    def reset(self):
+        """Reset for a new conversation turn."""
+        with self._lock:
+            self._audio_content_s = 0.0
+            self._video_content_s = 0.0
+            self._drift_history.clear()
+    
+    def notify_audio_content(self, num_samples):
+        """Called when real audio content is queued to the audio track."""
+        with self._lock:
+            self._audio_content_s += num_samples / self.audio_sample_rate
+    
+    def notify_video_content(self, num_frames):
+        """Called when real video frames are queued to the video track."""
+        with self._lock:
+            self._video_content_s += num_frames / self.video_fps
+    
+    def get_drift_ms(self):
+        """Calculate audio-video content delivery drift in milliseconds.
+        
+        Positive = more audio content than video, Negative = more video than audio.
+        """
+        with self._lock:
+            audio_t = self._audio_content_s
+            video_t = self._video_content_s
+        
+        drift_ms = (audio_t - video_t) * 1000
+        self._drift_history.append(drift_ms)
+        
+        # Log periodically (at most once per 2 seconds)
+        now = time.time()
+        if now - self._last_drift_log_time > 2.0:
+            avg_drift = sum(self._drift_history) / len(self._drift_history) if self._drift_history else 0
+            if abs(avg_drift) > self.drift_threshold_ms:
+                print(f"⚠️ SYNC DRIFT: avg={avg_drift:.1f}ms (audio={'ahead' if avg_drift > 0 else 'behind'}) "
+                      f"[audio_content={audio_t:.2f}s, video_content={video_t:.2f}s]")
+            self._last_drift_log_time = now
+        
+        return drift_ms
+
+
+# --- Idle Animation Cache ---
+
+class IdleAnimationCache:
+    """Pre-renders and caches idle animation frames using silent audio.
+    
+    Feeds 10 seconds of silence through IMTalker to generate ~250 frames of
+    natural micro-motion. Cached per-avatar (by image hash) so subsequent
+    sessions reuse the same loop instantly.
+    """
+    
+    IDLE_DURATION_S = 4.0  # Duration of idle loop (4s - reduced from 10s to save memory)
+    SAMPLE_RATE = 16000    # wav2vec2 expected rate
+    
+    def __init__(self):
+        self._cache = {}  # {avatar_hash: List[VideoFrame]}
+        self._lock = threading.Lock()
+        self._rendering = set()  # avatar hashes currently being rendered
+    
+    @staticmethod
+    def _hash_avatar(avatar_img):
+        """Fast hash of avatar image for cache key."""
+        import hashlib
+        arr = np.array(avatar_img.convert('RGB'))
+        # Use a downsampled version for speed
+        small = arr[::8, ::8, :].tobytes()
+        return hashlib.md5(small).hexdigest()
+    
+    def get_idle_frames(self, avatar_img):
+        """Get cached idle frames for an avatar, or None if not yet rendered."""
+        key = self._hash_avatar(avatar_img)
+        with self._lock:
+            return self._cache.get(key)
+    
+    def is_rendering(self, avatar_img):
+        """Check if idle animation is currently being rendered for this avatar."""
+        key = self._hash_avatar(avatar_img)
+        with self._lock:
+            return key in self._rendering
+    
+    def render_idle(self, avatar_img, imtalker_streamer):
+        """Render idle animation frames (blocking, call from thread).
+        
+        Generates silent audio and feeds it through the IMTalker pipeline
+        to produce natural micro-motion frames.
+        
+        Returns:
+            List[VideoFrame] - the cached idle loop frames
+        """
+        key = self._hash_avatar(avatar_img)
+        
+        # Check cache first
+        with self._lock:
+            if key in self._cache:
+                print(f"[IDLE CACHE] HIT for avatar {key[:8]}... ({len(self._cache[key])} frames)")
+                return self._cache[key]
+            if key in self._rendering:
+                print(f"[IDLE CACHE] Already rendering for {key[:8]}..., waiting...")
+                # Wait for render to complete
+                pass
+            self._rendering.add(key)
+        
+        try:
+            t_start = time.time()
+            print(f"[IDLE CACHE] Rendering idle animation for avatar {key[:8]}...")
+            
+            # Generate silent audio (2 seconds at 16kHz)
+            # Use very low amplitude noise instead of pure zeros for more natural result
+            silent_audio = np.random.randn(int(self.IDLE_DURATION_S * self.SAMPLE_RATE)).astype(np.float32) * 0.001
+            
+            def audio_iter():
+                yield silent_audio
+            
+            idle_frames = []
+            for video_frames, metrics in imtalker_streamer.generate_stream(avatar_img, audio_iter()):
+                for frame_tensor in video_frames:
+                    frame_rgb = process_frame_tensor(frame_tensor, format="RGB")
+                    av_frame = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
+                    idle_frames.append(av_frame)
+                    del frame_tensor, frame_rgb
+                del video_frames
+            
+            # Clear GPU memory after render
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            render_time = time.time() - t_start
+            print(f"[IDLE CACHE] ✓ Rendered {len(idle_frames)} idle frames in {render_time:.2f}s for avatar {key[:8]}...")
+            
+            # Store in cache
+            with self._lock:
+                self._cache[key] = idle_frames
+                self._rendering.discard(key)
+            
+            return idle_frames
+            
+        except Exception as e:
+            print(f"[IDLE CACHE] ERROR rendering idle animation: {e}")
+            traceback.print_exc()
+            with self._lock:
+                self._rendering.discard(key)
+            return None
+
+# Global idle cache instance
+idle_animation_cache = IdleAnimationCache()
+
 
 # --- WebRTC Tracks ---
 
 class IMTalkerVideoTrack(VideoStreamTrack):
-    def __init__(self, avatar_img):
+    """WebRTC video track with clean idle ↔ speech transitions.
+    
+    Key insight: aiortc's next_timestamp() calls recv() at its own internal
+    rate (~30 FPS). Content is pushed at 25 FPS. Between pushes, the queue
+    may be momentarily empty. During active speech, we REPEAT the last
+    speech frame instead of inserting idle frames (which caused glitches).
+    
+    States:
+      is_speaking=False → show idle animation (or static avatar)
+      is_speaking=True, queue has frame → show speech frame, save as last_speech_frame
+      is_speaking=True, queue empty → repeat last_speech_frame (no idle insertion)
+    """
+    def __init__(self, avatar_img, sync_manager=None, idle_frames=None):
         super().__init__()
         self.avatar_img = avatar_img
         self.frame_queue = asyncio.Queue()
-        # Convert avatar to RGB for idle frames
-        self.idle_frame = np.array(avatar_img.convert('RGB'))
+        self.sync_manager = sync_manager
+        self.static_idle_frame = np.array(avatar_img.convert('RGB'))
         
-        # Smoothness settings
-        self.prebuffer_size = 6  # Reduced from 20 to minimize startup latency (240ms vs 800ms)
-        self.is_buffering = True
+        self._idle_frames = idle_frames or []
+        self._idle_index = 0
+        self.is_speaking = False        # Set by av_streamer
+        self._last_speech_frame = None  # Hold frame for repeat during speech
+
+    def set_idle_frames(self, frames):
+        self._idle_frames = frames
+        print(f"VT: Idle animation set ({len(frames)} frames)")
+
+    def _get_idle_frame(self):
+        if self._idle_frames:
+            frame = self._idle_frames[self._idle_index % len(self._idle_frames)]
+            self._idle_index += 1
+            return frame
+        else:
+            return VideoFrame.from_ndarray(self.static_idle_frame, format="rgb24")
+
+    def start_speaking(self):
+        """Called when av_streamer begins pushing content.
+        Drains any stale frames from previous speech turn."""
+        self.is_speaking = True
+        self._last_speech_frame = None
+        # Drain stale frames from previous turn
+        drained = 0
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if drained:
+            print(f"VT: Drained {drained} stale frames from queue")
+
+    def stop_speaking(self):
+        """Called when av_streamer finishes. Resume idle animation."""
+        self.is_speaking = False
+        # Keep _last_speech_frame for smooth transition (first idle blends naturally)
 
     async def add_frame(self, av_frame):
         await self.frame_queue.put(av_frame)
@@ -1707,81 +2502,108 @@ class IMTalkerVideoTrack(VideoStreamTrack):
     async def recv(self):
         pts, time_base = await self.next_timestamp()
         
-        # If we are buffering, wait until we have enough frames
-        if self.is_buffering:
-            if self.frame_queue.qsize() < self.prebuffer_size:
-                # Return idle frame while buffering
-                frame = VideoFrame.from_ndarray(self.idle_frame, format="rgb24")
-                frame.pts = pts
-                frame.time_base = time_base
-                return frame
-            else:
-                self.is_buffering = False
-                print(f"VT: Pre-buffer filled ({self.frame_queue.qsize()} frames), starting playback.")
-
         try:
-            # Wait up to 50ms for a frame (2 frames at 25 FPS)
-            # This tolerates brief gaps between chunks while maintaining smooth FPS
-            frame = await asyncio.wait_for(self.frame_queue.get(), timeout=0.05)
-        except (asyncio.QueueEmpty, asyncio.TimeoutError):
-            # If nothing after 2 seconds, show idle frame but DON'T re-buffer
-            # This keeps playback smooth and avoids the 5+ second delays
-            frame = VideoFrame.from_ndarray(self.idle_frame, format="rgb24")
+            # FIFO delivery — serve frames in order, never skip.
+            # Wall-clock pacing in av_streamer prevents accumulation,
+            # and queue maxsize=30 provides backpressure if needed.
+            frame = self.frame_queue.get_nowait()
+            # Got a real speech frame — save it for repeat
+            self._last_speech_frame = frame
+        except asyncio.QueueEmpty:
+            if self.is_speaking and self._last_speech_frame is not None:
+                # During active speech, repeat the last speech frame.
+                # This prevents idle frames from being interspersed.
+                frame = self._last_speech_frame
+            else:
+                # Truly idle — show idle animation
+                frame = self._get_idle_frame()
         
         frame.pts = pts
         frame.time_base = time_base
         return frame
 
 class IMTalkerAudioTrack(AudioStreamTrack):
-    # This track handles audio generated by Chatterbox (24kHz)
-    def __init__(self):
+    """WebRTC audio track with clock-reset capability for lip sync.
+    
+    Key insight: recv() pacing is anchored to _recv_start + _timestamp/sample_rate.
+    During idle (silence), _recv_start is set once and _timestamp advances with silence
+    frames. When REAL content arrives, we call reset_clock() which re-anchors
+    _recv_start to NOW and resets _timestamp to 0. This ensures the audio clock
+    starts fresh at the exact moment content flows, matching the video track's content
+    delivery timing.
+    """
+    def __init__(self, sync_manager=None):
         super().__init__()
-        self.audio_queue = asyncio.Queue()
+        self.audio_queue = asyncio.Queue()  # Unbounded — overflow handled by caller
+        self.sync_manager = sync_manager
         self._timestamp = 0
-        self.sample_rate = 24000  # Chatterbox TTS sample rate
+        self._recv_start = None  # Set on first recv(); reset when content starts
+        self._content_frames = 0  # Count of real (non-silence) frames delivered
+        self.sample_rate = 24000
+        self.is_buffering = False
+
+    def reset_clock(self):
+        """Re-anchor the pacing clock to NOW.
+        
+        Called by av_streamer when the first real A/V pair is pushed.
+        This ensures the audio pacing clock starts at the same wall-clock
+        instant as the video content, eliminating lip-sync drift.
+        """
+        self._recv_start = time.time()
+        self._timestamp = 0
+        self._content_frames = 0
+        # Drain any stale silence/old data from the queue
+        drained = 0
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if drained > 0:
+            print(f"AT: Clock reset, drained {drained} stale frames")
+        else:
+            print(f"AT: Clock reset (queue empty)")
 
     async def add_audio(self, audio_np):
         """Expects normalized float32 numpy array. Splits into WebRTC-sized frames."""
         audio_int16 = (audio_np * 32767).astype(np.int16)
-        
-        # Check if audio has actual data
-        max_val = np.abs(audio_int16).max()
-        mean_val = np.abs(audio_int16).mean()
-        
-        # WebRTC expects small frames (20ms at 24kHz = 480 samples)
-        frame_size = 480
+        frame_size = 480  # 20ms at 24kHz
         num_frames = len(audio_int16) // frame_size
         
         for i in range(num_frames):
-            start = i * frame_size
-            end = start + frame_size
-            frame = audio_int16[start:end]
-            await self.audio_queue.put(frame)
+            await self.audio_queue.put(audio_int16[i * frame_size:(i + 1) * frame_size])
         
-        # Handle remaining samples
         remainder = len(audio_int16) % frame_size
         if remainder > 0:
-            # Pad with zeros to make a complete frame
             last_frame = np.zeros(frame_size, dtype=np.int16)
             last_frame[:remainder] = audio_int16[-remainder:]
             await self.audio_queue.put(last_frame)
-        
-        print(f"AT: Split {len(audio_int16)} samples into {num_frames + (1 if remainder > 0 else 0)} frames (queue: {self.audio_queue.qsize()}) - max: {max_val}, mean: {mean_val:.1f}")
 
     async def recv(self):
-        try:
-            # Wait up to 100ms for audio data
-            audio_int16 = await asyncio.wait_for(self.audio_queue.get(), timeout=0.1)
-            is_silence = False
-        except (asyncio.QueueEmpty, asyncio.TimeoutError):
-            # Return silence (20ms at 24kHz = 480 samples)
-            audio_int16 = np.zeros(480, dtype=np.int16)
-            is_silence = True
+        samples_per_frame = 480  # 20ms at 24kHz
         
-        # Log every few frames for debugging
-        if not is_silence:
-            if self.audio_queue.qsize() == 0 or self._timestamp % (self.sample_rate * 2) < 1000:
-                print(f"AT: Sending audio frame ({len(audio_int16)} samples, queue: {self.audio_queue.qsize()}, pts: {self._timestamp})")
+        # Initialize clock on very first call
+        if self._recv_start is None:
+            self._recv_start = time.time()
+        
+        # Wall-clock aligned pacing: sleep until it's time for this frame.
+        # target_time = anchor + (cumulative_samples / rate)
+        # This creates a perfectly smooth 20ms cadence regardless of jitter.
+        target_time = self._recv_start + (self._timestamp / self.sample_rate)
+        wait = target_time - time.time()
+        if wait > 0.001:  # Only sleep if > 1ms (avoid micro-sleeps)
+            await asyncio.sleep(wait)
+        elif wait < -0.1:
+            # Clock is >100ms behind reality — we've fallen behind.
+            # Re-anchor to prevent permanent burst mode.
+            self._recv_start = time.time() - (self._timestamp / self.sample_rate)
+        
+        # Non-blocking get — returns silence if queue is empty.
+        try:
+            audio_int16 = self.audio_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            audio_int16 = np.zeros(samples_per_frame, dtype=np.int16)
         
         frame = AudioFrame.from_ndarray(audio_int16.reshape(1, -1), format='s16', layout='mono')
         frame.sample_rate = self.sample_rate
@@ -1812,7 +2634,7 @@ async def generate_video(request: GenerateRequest):
         # Create TTS Stream
         tts_stream = tts_model.generate_stream(
             text=request.text,
-            chunk_size=10,  # Reduced for lower latency
+            chunk_size=50,  # Larger chunks for less overhead
             print_metrics=False
         )
         audio_iterator = chatterbox_adapter(tts_stream)
@@ -1864,7 +2686,7 @@ async def generate_video_stream(request: GenerateRequest):
         # Create TTS Stream
         tts_stream = tts_model.generate_stream(
             text=request.text,
-            chunk_size=10,  # Reduced for lower latency
+            chunk_size=50,  # Larger chunks for less overhead
             print_metrics=False
         )
         audio_iterator = chatterbox_adapter(tts_stream)
@@ -1986,7 +2808,7 @@ async def generate_video_stream_get(text: str, avatar: str = "assets/source_1.pn
         # Create TTS Stream
         tts_stream = tts_model.generate_stream(
             text=text,
-            chunk_size=10,  # Reduced for lower latency
+            chunk_size=50,  # Larger chunks for less overhead
             print_metrics=False
         )
         audio_iterator = chatterbox_adapter(tts_stream)
@@ -2047,6 +2869,56 @@ async def generate_video_stream_get(text: str, avatar: str = "assets/source_1.pn
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+async def _cleanup_webrtc_session(session_id: str, reason: str = "unknown"):
+    """Full cleanup of a WebRTC session: close PC, cleanup ConvManager, free GPU, clear state."""
+    logger.info(f"🧹 Cleaning up session {session_id} (reason: {reason})")
+    
+    meta = app.state.active_session_meta.get(session_id)
+    
+    # 1. Cleanup ConversationManager (executors, buffers)
+    if meta and meta.get("conv_manager"):
+        try:
+            meta["conv_manager"].cleanup()
+        except Exception as e:
+            logger.error(f"ConvManager cleanup error: {e}")
+    
+    # 2. Drain track queues to free memory
+    if meta:
+        for track_key in ("video_track", "audio_track"):
+            track = meta.get(track_key)
+            if track and hasattr(track, 'frame_queue'):
+                while not track.frame_queue.empty():
+                    try: track.frame_queue.get_nowait()
+                    except: break
+            if track and hasattr(track, 'audio_queue'):
+                while not track.audio_queue.empty():
+                    try: track.audio_queue.get_nowait()
+                    except: break
+    
+    # 3. Close PeerConnection
+    pc = app.state.webrtc_sessions.get(session_id)
+    if pc:
+        try:
+            await pc.close()
+        except Exception as e:
+            logger.error(f"PC close error: {e}")
+    
+    # 4. Remove from all session stores
+    app.state.webrtc_sessions.pop(session_id, None)
+    app.state.active_session_meta.pop(session_id, None)
+    
+    # 5. Clear the active session slot
+    if app.state.active_webrtc_session == session_id:
+        app.state.active_webrtc_session = None
+    
+    # 6. Free GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc; gc.collect()
+    
+    logger.info(f"✅ Session {session_id} fully cleaned up.")
+
+
 @app.post("/offer")
 async def webrtc_offer(request: Request):
     try:
@@ -2059,11 +2931,30 @@ async def webrtc_offer(request: Request):
         avatar = data.get("avatar", "assets/source_1.png")
         conv_mode = data.get("conv_mode", False)
         text = data.get("initial_text", data.get("text", "Hello, I am ready to talk."))
+        greeting = data.get("greeting", data.get("initial_greeting", "Hi there! How are you doing today?"))
         reference_audio = data.get("reference_audio", None)
         system_prompt = data.get("system_prompt", None)
         crop = data.get("crop", True)
+        force = data.get("force", False)  # Force-disconnect existing session
         
-        logger.info(f"Params: conv_mode={conv_mode}, crop={crop}, text='{text[:30]}...', avatar_len={len(avatar) if avatar else 0}, ref_audio_len={len(reference_audio) if reference_audio else 0}")
+        logger.info(f"Params: conv_mode={conv_mode}, crop={crop}, greeting='{greeting[:40] if greeting else None}'")
+        
+        if not sdp:
+            raise HTTPException(status_code=400, detail="SDP is required")
+
+        # ─── Single-session guard: only ONE WebRTC session at a time ───
+        async with app.state._session_lock:
+            existing = app.state.active_webrtc_session
+            if existing and existing in app.state.webrtc_sessions:
+                if force:
+                    logger.warning(f"⚠️ Force-disconnecting existing session {existing}")
+                    await _cleanup_webrtc_session(existing, reason="force-replaced")
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Another session is already active: {existing}. "
+                               f"Send force=true to disconnect it, or POST /disconnect first."
+                    )
         
         if not sdp:
             raise HTTPException(status_code=400, detail="SDP is required")
@@ -2131,16 +3022,47 @@ async def webrtc_offer(request: Request):
             )
         )
         
-        # Create Tracks
-        video_track = IMTalkerVideoTrack(avatar_img)
-        audio_track = IMTalkerAudioTrack()
+        # Create shared A/V sync manager
+        sync_manager = AVSyncManager(video_fps=25.0, audio_sample_rate=24000)
+        
+        # Get or render idle animation frames for instant realistic idle
+        idle_frames = idle_animation_cache.get_idle_frames(avatar_img)
+        
+        # Create Tracks with shared sync and idle animation
+        video_track = IMTalkerVideoTrack(avatar_img, sync_manager=sync_manager, idle_frames=idle_frames)
+        audio_track = IMTalkerAudioTrack(sync_manager=sync_manager)
         
         pc.addTrack(video_track)
         pc.addTrack(audio_track)
 
-        # Session ID
+        # Session ID + register as active
         session_id = str(uuid.uuid4())
         app.state.webrtc_sessions[session_id] = pc
+        app.state.active_webrtc_session = session_id
+        app.state.active_session_meta[session_id] = {
+            "session_id": session_id,
+            "status": "connecting",       # connecting → greeting → ready → disconnected
+            "greeting_done": False,
+            "conv_mode": conv_mode,
+            "video_track": video_track,
+            "audio_track": audio_track,
+            "conv_manager": None,
+            "created_at": time.time(),
+        }
+        
+        # Kick off idle animation render in background if not cached yet
+        if idle_frames is None and not idle_animation_cache.is_rendering(avatar_img):
+            async def render_idle_bg():
+                try:
+                    frames = await asyncio.get_event_loop().run_in_executor(
+                        None, idle_animation_cache.render_idle, avatar_img, imtalker_streamer
+                    )
+                    if frames:
+                        video_track.set_idle_frames(frames)
+                        logger.info(f"Idle animation ready for session {session_id} ({len(frames)} frames)")
+                except Exception as e:
+                    logger.error(f"Background idle render failed: {e}")
+            asyncio.create_task(render_idle_bg())
 
         # Conversation Manager (optional)
         conv_manager = None
@@ -2151,8 +3073,10 @@ async def webrtc_offer(request: Request):
                 openai_client, tts_model, imtalker_streamer, 
                 video_track, audio_track, avatar_img,
                 system_prompt=system_prompt,
-                reference_audio=reference_audio
+                reference_audio=reference_audio,
+                sync_manager=sync_manager
             )
+            app.state.active_session_meta[session_id]["conv_manager"] = conv_manager
 
         @pc.on("track")
         def on_track(track):
@@ -2173,46 +3097,70 @@ async def webrtc_offer(request: Request):
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
-            logger.info(f"Connection state for {session_id} is {pc.connectionState}")
-            if pc.connectionState == "connected":
-                # If not in conversational mode, we might want to start a one-shot generation
-                if not conv_mode:
-                    # Original logic for one-shot text-to-video
-                    tts_stream = tts_model.generate_stream(text=text, chunk_size=20, print_metrics=False)
-                    audio_iterator = chatterbox_adapter(tts_stream)
+            state = pc.connectionState
+            logger.info(f"Connection state for {session_id}: {state}")
+            meta = app.state.active_session_meta.get(session_id, {})
+            
+            if state == "connected":
+                meta["status"] = "greeting"
+                
+                # Push the PRE-RENDERED greeting (rendered during /offer processing)
+                pairs = meta.get("pre_rendered_pairs")
+                greeting_cm = meta.get("greeting_cm") or conv_manager
+                
+                if pairs and greeting_cm:
+                    logger.info(f"🎙️ Pushing pre-rendered greeting ({len(pairs)} A/V pairs)...")
+                    try:
+                        await greeting_cm.push_buffered_greeting(pairs)
+                        logger.info("✅ Greeting delivered (pre-rendered).")
+                    except Exception as e:
+                        logger.error(f"Greeting push failed: {e}")
                     
-                    def run_one_shot():
-                        for video_frames, metrics in imtalker_streamer.generate_stream(avatar_img, audio_iterator):
-                            for frame_tensor in video_frames:
-                                frame_bgr = process_frame_tensor(frame_tensor)
-                                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                                av_frame = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
-                                asyncio.run_coroutine_threadsafe(video_track.add_frame(av_frame), asyncio.get_event_loop())
+                    # Free the buffer
+                    meta.pop("pre_rendered_pairs", None)
                     
-                        # Feed audio as well
-                        # Re-running TTS stream to feed audio track properly (or adapt chatterbox_adapter)
-                        # Actually the tracks are now refillable.
-                    
-                    # For one-shot, we can use a simpler distributor like before but feeding into tracks
-                    # but let's keep it consistent.
-                    async def feed_one_shot():
-                        # We need to feed both. The new tracks expect add_frame/add_audio.
-                        # Let's reuse generating_and_feed logic but without OpenAI
-                        # Let's reuse generating_and_feed logic but without OpenAI
-                        temp_conv = ConversationManager(
-                            openai_client, tts_model, imtalker_streamer, 
-                            video_track, audio_track, avatar_img,
-                            system_prompt=system_prompt,
-                            reference_audio=reference_audio
-                        )
-                        await temp_conv.generate_and_feed(text)
-                    
-                    asyncio.create_task(feed_one_shot())
+                    # Cleanup temp CM if one-shot
+                    temp_cm = meta.pop("greeting_cm", None)
+                    if not conv_mode and temp_cm and temp_cm is not conv_manager:
+                        temp_cm.cleanup()
+                else:
+                    logger.warning("No pre-rendered greeting available")
+                
+                meta["status"] = "ready"
+                meta["greeting_done"] = True
+                logger.info(f"📡 Session {session_id} is READY (greeting delivered).")
 
-            elif pc.connectionState == "failed" or pc.connectionState == "closed":
-                await pc.close()
-                if session_id in app.state.webrtc_sessions:
-                    del app.state.webrtc_sessions[session_id]
+            elif state in ("failed", "closed", "disconnected"):
+                await _cleanup_webrtc_session(session_id, reason=state)
+
+        # ─── Pre-render greeting BEFORE returning SDP answer ───
+        # This keeps the frontend on 'connecting' screen while TTS + render runs.
+        # When WebRTC connects, the pre-rendered greeting plays INSTANTLY.
+        pre_rendered_pairs = None
+        greet_text = greeting or text
+        if greet_text:
+            t_prerender = time.time()
+            logger.info(f"🎙️ Pre-rendering greeting: '{greet_text[:50]}...'")
+            target_cm = conv_manager
+            if not target_cm:
+                # One-shot: create temp ConversationManager for rendering
+                target_cm = ConversationManager(
+                    openai_client, tts_model, imtalker_streamer, 
+                    video_track, audio_track, avatar_img,
+                    system_prompt=system_prompt,
+                    reference_audio=reference_audio,
+                    sync_manager=sync_manager
+                )
+            try:
+                pre_rendered_pairs = await target_cm.pre_render_to_buffer(greet_text)
+                logger.info(f"✅ Greeting pre-rendered: {len(pre_rendered_pairs)} pairs in {time.time() - t_prerender:.2f}s")
+            except Exception as e:
+                logger.error(f"Greeting pre-render failed: {e}")
+                traceback.print_exc()
+            
+            # Store in session meta for the connected handler
+            app.state.active_session_meta[session_id]["pre_rendered_pairs"] = pre_rendered_pairs
+            app.state.active_session_meta[session_id]["greeting_cm"] = target_cm
 
         # Handle offer
         offer = RTCSessionDescription(sdp=sdp, type="offer") # default to offer
@@ -2227,9 +3175,14 @@ async def webrtc_offer(request: Request):
         return {
             "sdp": pc.localDescription.sdp,
             "type": pc.localDescription.type,
-            "session_id": session_id
+            "session_id": session_id,
+            "status": "connecting",
+            "greeting": greeting if greeting else text,
+            "conv_mode": conv_mode
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"WebRTC Offer Error: {e}")
         traceback.print_exc()
@@ -2260,6 +3213,59 @@ async def webrtc_ice(request: Request):
     except Exception as e:
         print(f"ICE Error: {e}")
         return {"status": "error", "detail": str(e)}
+
+
+@app.post("/disconnect")
+async def webrtc_disconnect(request: Request):
+    """Explicitly disconnect a WebRTC session, freeing all resources.
+    
+    Body: {"session_id": "..."} or {} to disconnect the active session.
+    """
+    try:
+        data = await request.json()
+        session_id = data.get("session_id", app.state.active_webrtc_session)
+        
+        if not session_id:
+            return {"status": "ok", "detail": "No active session to disconnect."}
+        
+        if session_id not in app.state.webrtc_sessions:
+            # Already gone — just clear state
+            app.state.active_session_meta.pop(session_id, None)
+            if app.state.active_webrtc_session == session_id:
+                app.state.active_webrtc_session = None
+            return {"status": "ok", "detail": f"Session {session_id} already cleaned up."}
+        
+        await _cleanup_webrtc_session(session_id, reason="client-disconnect")
+        
+        return {"status": "ok", "session_id": session_id, "detail": "Session disconnected and cleaned up."}
+    except Exception as e:
+        logger.error(f"Disconnect error: {e}")
+        return {"status": "error", "detail": str(e)}
+
+
+@app.get("/session/status")
+async def session_status(session_id: Optional[str] = None):
+    """Check session status. Returns 'connecting', 'greeting', 'ready', or 'no_session'.
+    
+    The client should poll this after /offer until status='ready' (greeting finished).
+    """
+    sid = session_id or app.state.active_webrtc_session
+    
+    if not sid or sid not in app.state.active_session_meta:
+        return {
+            "status": "no_session",
+            "active_session": None,
+            "detail": "No active WebRTC session."
+        }
+    
+    meta = app.state.active_session_meta[sid]
+    return {
+        "session_id": sid,
+        "status": meta.get("status", "unknown"),
+        "greeting_done": meta.get("greeting_done", False),
+        "conv_mode": meta.get("conv_mode", False),
+        "uptime_s": round(time.time() - meta.get("created_at", time.time()), 1),
+    }
 
 # --- Original CLI Logic (Modified to use models if available) ---
 
@@ -2297,25 +3303,15 @@ def process_frame_tensor(frame_tensor, format="BGR"):
     if frame_tensor.dim() == 4:
         frame_tensor = frame_tensor.squeeze(0)
     
-    # [3, H, W] -> [H, W, 3]
-    frame_np = frame_tensor.permute(1, 2, 0).detach().cpu().numpy()
-    
-    # Post-process: [-1, 1] or [0, 1] -> [0, 255]
-    # Check range
-    if frame_np.min() < 0:
-        frame_np = (frame_np + 1) / 2
-    
-    frame_np = np.nan_to_num(frame_np)
-    frame_np = np.clip(frame_np, 0, 1)
-    frame_np = (frame_np * 255).astype(np.uint8)
-    
+    # [3, H, W] -> [H, W, 3] -> [0, 255] uint8
+    # Fast path: model outputs [0, 1] range with FP32 (no NaN/range check needed)
+    frame_np = (frame_tensor.permute(1, 2, 0).detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
     
     if format == "RGB":
         return frame_np
     
     # RGB to BGR for OpenCV
-    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-    return frame_bgr
+    return cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
 
 def main():
     parser = argparse.ArgumentParser(description="Text to Video Streaming with Chatterbox and IMTalker")
@@ -2996,7 +3992,7 @@ async def api_tts_generate(
 ):
     """
     Generate speech from text with optional voice cloning.
-    Matches expectations of tts_service.py.
+    Splits long text into segments to avoid CUDA positional encoding overflow.
     """
     try:
         # 1. Prepare conditionals if reference audio is provided
@@ -3007,7 +4003,6 @@ async def api_tts_generate(
                 temp_ref.write(content)
                 temp_ref.close()
                 
-                # Use thread pool for heavy model operations
                 await asyncio.to_thread(
                     app.state.tts_model.prepare_conditionals,
                     wav_fpath=temp_ref.name,
@@ -3017,39 +4012,53 @@ async def api_tts_generate(
                 if os.path.exists(temp_ref.name):
                     os.remove(temp_ref.name)
         
-        # 2. Generate audio
-        # Note: ChatterboxTTS.generate returns a torch.Tensor
-        # We need to convert it to a WAV byte stream
-        audio_tensor = await asyncio.to_thread(
-            app.state.tts_model.generate,
-            text=text,
-            exaggeration=exaggeration,
-            temperature=temperature
-            # Note: seed, diffusion_steps, min_p, top_p, repetition_penalty 
-            # might not be fully supported by the current ChatterboxTTS.generate signature
-            # but we can pass what's available.
-        )
+        # 2. Split long text into safe segments to avoid positional encoding overflow
+        # Chatterbox's positional encoding table has a fixed size; long texts cause
+        # CUDA indexSelectLargeIndex assertion failures.
+        MAX_SEGMENT_CHARS = 200  # ~8s of speech, safe for positional encoding
+        text_segments = split_text_semantically(text, min_chunk_length=20, max_chunk_length=MAX_SEGMENT_CHARS)
+        logger.info(f"TTS API: Generating {len(text_segments)} segments from {len(text)} chars")
         
-        # 3. Convert tensor to WAV bytes
-        audio_np = audio_tensor.squeeze(0).cpu().numpy()
+        # 3. Generate audio for each segment and concatenate
+        all_audio = []
         
-        # Ensure correct sample rate (S3GEN_SR = 24000)
+        def generate_segments():
+            for i, segment in enumerate(text_segments):
+                logger.info(f"TTS API: Segment {i+1}/{len(text_segments)} ({len(segment)} chars): '{segment[:50]}...'")
+                audio_tensor = app.state.tts_model.generate(
+                    text=segment,
+                    exaggeration=exaggeration,
+                    temperature=temperature
+                )
+                audio_np = audio_tensor.squeeze(0).cpu().numpy()
+                all_audio.append(audio_np)
+                del audio_tensor
+                # Free GPU memory between segments to prevent OOM
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            return np.concatenate(all_audio, axis=-1)
+        
+        audio_np = await asyncio.to_thread(generate_segments)
+        
+        # 4. Convert to WAV bytes
         sr = getattr(app.state.tts_model, 'sr', 24000)
         
-        # Write to byte stream
         byte_io = io.BytesIO()
-        # librosa or wave can be used to write wav to bytes
-        # Using wave for minimal dependencies
         with wave.open(byte_io, 'wb') as wav_file:
             wav_file.setnchannels(1)
-            wav_file.setsampwidth(2) # 16-bit
+            wav_file.setsampwidth(2)  # 16-bit
             wav_file.setframerate(sr)
             
             # Normalize and convert to int16
-            if np.max(np.abs(audio_np)) > 1.0:
-                audio_np = audio_np / np.max(np.abs(audio_np))
+            peak = np.max(np.abs(audio_np))
+            if peak > 1.0:
+                audio_np = audio_np / peak
             audio_int16 = (audio_np * 32767).astype(np.int16)
             wav_file.writeframes(audio_int16.tobytes())
+        
+        del audio_np, all_audio
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             
         byte_io.seek(0)
         return StreamingResponse(byte_io, media_type="audio/wav")
@@ -3057,6 +4066,9 @@ async def api_tts_generate(
     except Exception as e:
         logger.error(f"TTS Generation failed: {str(e)}")
         traceback.print_exc()
+        # Clean up GPU memory on failure
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         raise HTTPException(status_code=500, detail=f"TTS Generation failed: {str(e)}")
 
 if __name__ == "__main__":

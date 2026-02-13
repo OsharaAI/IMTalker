@@ -148,6 +148,17 @@
         }
 
         .status-idle { background: rgba(51, 65, 85, 0.4); color: #94a3b8; }
+        .status-connecting { background: rgba(180, 130, 20, 0.4); color: #fbbf24; }
+        .status-connecting::before {
+            content: '';
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #fbbf24;
+            margin-right: 6px;
+            animation: pulse 1s infinite;
+        }
         .status-streaming { background: rgba(6, 95, 70, 0.4); color: #34d399; }
         .status-streaming::before {
             content: "";
@@ -344,10 +355,9 @@
 
                 pc.oniceconnectionstatechange = () => {
                     console.log("ICE Connection State:", pc.iceConnectionState);
-                    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-                        statusBadge.textContent = conversational ? 'AI Conversation Active' : 'WebRTC Connected';
-                        if (!conversational) infoText.textContent = 'WebRTC stream active.';
-                    } else if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+                    // Do NOT flip to 'Active' here — wait for greeting to finish via polling.
+                    // Only handle failure/close states.
+                    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
                         statusBadge.textContent = 'Disconnected';
                         statusBadge.className = 'status-badge status-idle';
                         webrtcBtn.disabled = false;
@@ -450,6 +460,44 @@
                 }));
 
                 statusBadge.textContent = 'Connecting...';
+                statusBadge.className = 'status-badge status-connecting';
+                infoText.textContent = 'Setting up avatar and generating greeting...';
+
+                // Poll /session/status until greeting is delivered
+                const pollStatus = async () => {
+                    const maxWait = 120000; // 2 min max
+                    const interval = 500;   // check every 500ms
+                    let elapsed = 0;
+                    while (elapsed < maxWait) {
+                        try {
+                            const res = await fetch(`/session/status?session_id=${currentSessionID}`);
+                            const st = await res.json();
+                            console.log('Session status:', st.status, 'greeting_done:', st.greeting_done);
+                            if (st.greeting_done) {
+                                return true;
+                            }
+                            if (st.status === 'no_session') {
+                                return false;
+                            }
+                        } catch (e) {
+                            console.warn('Status poll error:', e);
+                        }
+                        await new Promise(r => setTimeout(r, interval));
+                        elapsed += interval;
+                    }
+                    return false; // timed out
+                };
+
+                const greetingOk = await pollStatus();
+                if (greetingOk) {
+                    statusBadge.textContent = conversational ? 'AI Conversation Active' : 'WebRTC Connected';
+                    statusBadge.className = 'status-badge status-streaming';
+                    if (!conversational) infoText.textContent = 'WebRTC stream active.';
+                    else infoText.textContent = 'Greeting delivered. Say something!';
+                } else {
+                    statusBadge.textContent = 'Connection Issue';
+                    statusBadge.className = 'status-badge status-idle';
+                }
 
             } catch (err) {
                 console.error('WebRTC error:', err);
