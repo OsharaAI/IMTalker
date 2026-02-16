@@ -61,6 +61,12 @@ except ImportError as e:
     print(f"Import Error: {e}")
     print("Please ensure 'generator' and 'renderer' folders are in the same directory.")
 
+try: 
+    from trt_handler import TRTInferenceHandler
+except ImportError:
+    print("TRT Handler not found/importable.")
+    TRTInferenceHandler = None
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -81,6 +87,7 @@ app.add_middleware(
 # Global variables
 cfg = None
 agent = None
+trt_handler = None
 output_dir = "./outputs"
 
 # HLS session storage for live streaming
@@ -940,6 +947,16 @@ async def startup_event():
             print("Loading models...")
             agent = InferenceAgent(cfg)
             print("Models loaded successfully!")
+
+            # Initialize TRT Handler
+            if TRTInferenceHandler is not None:
+                global trt_handler
+                try:
+                    trt_handler = TRTInferenceHandler(agent)
+                except Exception as e:
+                    print(f"Failed to initialize TRT Handler: {e}")
+                    trt_handler = None
+
         else:
             print("Error: Checkpoints not found.")
             raise FileNotFoundError("Model checkpoints not found")
@@ -971,6 +988,7 @@ async def health():
         "models": {
             "renderer": os.path.exists(cfg.renderer_path) if cfg else False,
             "generator": os.path.exists(cfg.generator_path) if cfg else False,
+            "trt_available": trt_handler.is_available() if trt_handler else False,
         }
     }
 
@@ -2836,6 +2854,83 @@ async def realtime_ws(websocket: WebSocket, session_id: str):
             pass
             
 
+@app.post("/api/trt-inference")
+async def schedule_trt_inference(
+    image: UploadFile = File(..., description="Source image (PNG/JPG)"),
+    audio: UploadFile = File(..., description="Driving audio (WAV/MP3)"),
+    crop: bool = Form(True, description="Auto crop face"),
+    seed: int = Form(42, description="Random seed"),
+    nfe: int = Form(10, description="Steps"),
+    cfg_scale: float = Form(2.0, description="CFG Scale"),
+):
+    """
+    Run inference using the optimized TensorRT hybrid pipeline.
+    
+    This endpoint utilizes TensorRT engines for the Source Encoder and Audio Renderer,
+    while running the Motion Generator in PyTorch. This offers significantly faster
+    inference speeds (up to 2x) compared to the standard PyTorch pipeline.
+    
+    Requires:
+    - TensorRT installed
+    - Built TRT engines in ./trt_engines/
+    """
+    if trt_handler is None or not trt_handler.is_available():
+        raise HTTPException(
+            status_code=503, 
+            detail="TensorRT Inference not available. Check server logs to see if engines were loaded correctly."
+        )
+        
+    img_path = None
+    aud_path = None
+    
+    try:
+        # Save temporary files
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            img_path = tmp.name
+            shutil.copyfileobj(image.file, tmp)
+            
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            aud_path = tmp.name
+            shutil.copyfileobj(audio.file, tmp)
+            
+        img_pil = Image.open(img_path).convert('RGB')
+        
+        print(f"[TRT API] Starting inference for {img_path} + {aud_path}")
+        
+        # Run in threadpool to avoid blocking event loop
+        # Note: trt_handler.run_inference returns path to saved video
+        video_path = await asyncio.to_thread(
+            trt_handler.run_inference, 
+            img_pil, 
+            aud_path, 
+            crop, 
+            seed, 
+            nfe, 
+            cfg_scale
+        )
+        
+        print(f"[TRT API] Success! Video saved to {video_path}")
+        
+        # Return video file
+        return FileResponse(
+            video_path, 
+            media_type="video/mp4", 
+            filename="output.mp4"
+        )
+        
+    except Exception as e:
+        print(f"[TRT API] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Cleanup input files
+        if img_path and os.path.exists(img_path):
+            os.remove(img_path)
+        if aud_path and os.path.exists(aud_path):
+            os.remove(aud_path)
+
+
 if __name__ == "__main__":
     import argparse
     
@@ -2852,4 +2947,3 @@ if __name__ == "__main__":
         port=args.port,
         reload=args.reload
     )
-
