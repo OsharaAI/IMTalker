@@ -374,7 +374,16 @@ class ModulatedConv2d(nn.Module):
         )
 
     def forward(self, input, style):
+        # if self.demodulate:
+            # DEBUG
+            # print(f"ModConv: input={input.shape}, style={style.shape}, w={self.weight.shape}")
+
         batch, in_channel, height, width = input.shape
+        # Force concrete shapes for ONNX export
+        batch = int(batch) if torch.is_tensor(batch) else batch
+        in_channel = int(in_channel)
+        height = int(height)
+        width = int(width)
 
         style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
         weight = self.scale * self.weight * style
@@ -391,20 +400,25 @@ class ModulatedConv2d(nn.Module):
             weight = weight.transpose(1, 2).reshape(batch * in_channel, self.out_channel, self.kernel_size,
                                                     self.kernel_size)
             out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            # Correct output size for ConvTranspose2d with stride=2, padding=0
+            out_h = (height - 1) * 2 + self.kernel_size
+            out_w = (width - 1) * 2 + self.kernel_size
+            out = out.view(batch, self.out_channel, out_h, out_w)
             out = self.blur(out)
         elif self.downsample:
             input = self.blur(input)
-            _, _, height, width = input.shape
-            input = input.view(1, batch * in_channel, height, width)
+            _, _, h_down, w_down = input.shape
+            h_down, w_down = int(h_down), int(w_down)
+            
+            input = input.view(1, batch * in_channel, h_down, w_down)
             out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            # Correct output size for Conv2d with stride=2, padding=0
+            out_h = (h_down - self.kernel_size) // 2 + 1
+            out_w = (w_down - self.kernel_size) // 2 + 1
+            out = out.view(batch, self.out_channel, out_h, out_w)
         else:
             input = input.view(1, batch * in_channel, height, width)
             out = F.conv2d(input, weight, padding=self.padding, groups=batch)
-            _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
 
         return out

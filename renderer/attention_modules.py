@@ -18,9 +18,10 @@ def window_reverse(windows, window_size, H, W):
 
 class StandardUnifiedAttention(nn.Module):
 
-    def __init__(self, dim, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0., use_sdpa=False):
         super().__init__()
         self.num_heads = num_heads
+        self.use_sdpa = use_sdpa
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
@@ -32,13 +33,34 @@ class StandardUnifiedAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, query, key, value, mask=None):
+    def forward(self, query, key, value, mask=None, return_attn=True):
         B, N, C = query.shape
 
         q = self.q_proj(query).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         k = self.k_proj(key).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         v = self.v_proj(value).view(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
+        # Optimization: Use Flash Attention (SDPA) if attention map is not needed
+        # We can't use SDPA if 'return_attn' is True because SDPA doesn't return weights.
+        if self.use_sdpa and not return_attn:
+            # Check if mask is compatible or None. 
+            # SDPA supports explicit 'attn_mask' but it's cleaner without it or with standard shapes.
+            # Here assuming mask is handled or we pass it if it exists.
+            # Note: q, k, v are [B, H, N, D]
+            dropout_p = self.attn_drop.p if self.training else 0.0
+            
+            # Simple conversion of mask if present
+            # If mask is provided, pass it.
+            
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p)
+            
+            # Reshape back
+            x = x.transpose(1, 2).reshape(B, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x, None
+
+        # Fallback to Manual Attention if weights are required
         attn = (q @ k.transpose(-2, -1)) * self.scale
 
         if mask is not None:
@@ -185,11 +207,11 @@ class SwinUnifiedAttention(nn.Module):
 class UnifiedTransformerBlock(nn.Module):
     """统一的标准 Transformer Block。"""
     def __init__(self, dim, input_resolution, num_heads, mlp_ratio=2.0, qkv_bias=True,
-                 drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_sdpa=False):
         super().__init__()
         self.norm_q = norm_layer(dim)
         self.norm_kv = norm_layer(dim)
-        self.attn = StandardUnifiedAttention(dim, num_heads, qkv_bias, attn_drop, drop)
+        self.attn = StandardUnifiedAttention(dim, num_heads, qkv_bias, attn_drop, drop, use_sdpa=use_sdpa)
 
         H, W = to_2tuple(input_resolution)
         dim_spatial = H * W
@@ -219,7 +241,7 @@ class UnifiedTransformerBlock(nn.Module):
         k_norm = self.norm_kv(k_in + self.k_pos_embedding)
         v_norm = self.norm_kv(v_in)
         
-        attn_output, _ = self.attn(query=q_norm, key=k_norm, value=v_norm)
+        attn_output, _ = self.attn(query=q_norm, key=k_norm, value=v_norm, return_attn=False)
         
         x = shortcut + attn_output
         x = x + self.mlp(self.norm_ffn(x))
@@ -310,9 +332,10 @@ class CrossAttention(nn.Module):
     def __init__(self, args, dim, resolution):
         super().__init__()
         self.is_standard_attention = resolution[0] < args.swin_res_threshold
+        use_sdpa = getattr(args, 'use_sdpa', False)
 
         if self.is_standard_attention:
-            self.block_efc = StandardUnifiedAttention(dim=dim, num_heads=args.num_heads)
+            self.block_efc = StandardUnifiedAttention(dim=dim, num_heads=args.num_heads, use_sdpa=use_sdpa)
         else:
             anchor_resolution = args.swin_res_threshold
             ratio = 2 * (resolution[0] / anchor_resolution)
@@ -351,16 +374,23 @@ class SelfAttention(nn.Module):
     def __init__(self, args, dim, resolution):
         super().__init__()
         self.blocks = nn.ModuleList()
+        use_sdpa = getattr(args, 'use_sdpa', False)
         
         common_kwargs = {
             'dim': dim,
             'input_resolution': resolution,
             'num_heads': args.num_heads,
+            'use_sdpa': use_sdpa
         }
 
         if resolution[0] >= args.swin_res_threshold:
-            self.blocks.append(UnifiedSwinBlock(window_size=args.window_size, shift_size=0, **common_kwargs))
-            self.blocks.append(UnifiedSwinBlock(window_size=args.window_size, shift_size=args.window_size // 2, **common_kwargs))
+            # Swin blocks don't support SDPA yet in this implementation, so we remove it from kwargs if necessary 
+            # or just let it be ignored if SwinUnifiedBlock consumes **kwargs but likely it's explicit.
+            # UnifiedSwinBlock does NOT accept use_sdpa. So we must pop it or create separate kwargs.
+            swin_kwargs = common_kwargs.copy()
+            swin_kwargs.pop('use_sdpa')
+            self.blocks.append(UnifiedSwinBlock(window_size=args.window_size, shift_size=0, **swin_kwargs))
+            self.blocks.append(UnifiedSwinBlock(window_size=args.window_size, shift_size=args.window_size // 2, **swin_kwargs))
         else:
             self.blocks.append(UnifiedTransformerBlock(mlp_ratio=2.0, **common_kwargs))
 
