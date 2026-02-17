@@ -169,6 +169,23 @@ async def lifespan(app: FastAPI):
     # Point to STTS-Server (assuming running on port 5000)
     app.state.tts_model = RemoteChatterboxTTS.from_pretrained(device=device, server_url="http://localhost:4000")
     
+    # 1b. Warmup STTS server (pre-cache voice conditioning + compile T3 model)
+    # This eliminates ~2-5s latency on the first TTS request
+    try:
+        import httpx
+        print("Lifespan: Warming up STTS server TTS model...")
+        warmup_resp = httpx.post(
+            "http://localhost:4000/tts/warmup",
+            json={},
+            timeout=120.0  # warmup can take up to ~60s on first compile
+        )
+        if warmup_resp.status_code == 200:
+            print(f"✅ STTS server warmup complete: {warmup_resp.json()}")
+        else:
+            print(f"⚠️ STTS warmup returned {warmup_resp.status_code}: {warmup_resp.text[:200]}")
+    except Exception as e_warmup:
+        print(f"⚠️ STTS warmup failed (non-fatal, first request will be slower): {e_warmup}")
+    
     # 2. Initialize IMTalker
     print("Lifespan: Loading IMTalker...")
     imtalker_cfg = IMTalkerConfig()
