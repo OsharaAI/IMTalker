@@ -80,6 +80,14 @@ sys.path.append(current_dir)
 from imtalker_streamer import IMTalkerStreamer, IMTalkerConfig
 from remote_tts import RemoteChatterboxTTS
 
+# Try importing TensorRT handler for accelerated inference
+try:
+    from trt_handler import TRTInferenceHandler
+    print("TRTInferenceHandler imported successfully.")
+except ImportError as e:
+    print(f"TRT Handler not found/importable: {e}")
+    TRTInferenceHandler = None
+
 # ─── Configurable Constants ───
 MAX_CONCURRENT_WEBRTC_SESSIONS = 3  # Max simultaneous WebRTC sessions (increase if GPU can handle it)
 
@@ -176,6 +184,25 @@ async def lifespan(app: FastAPI):
     app.state.imtalker_streamer = IMTalkerStreamer(imtalker_cfg, device=device)
     # Initialize InferenceAgent sharing the same models
     app.state.inference_agent = InferenceAgent(imtalker_cfg, models=(app.state.imtalker_streamer.renderer, app.state.imtalker_streamer.generator))
+    
+    # 3. Initialize TensorRT Handler (optional, for accelerated inference)
+    app.state.trt_handler = None
+    if TRTInferenceHandler is not None:
+        try:
+            trt_engine_dir = os.path.join(current_dir, "trt_engines")
+            trt_handler = TRTInferenceHandler(app.state.inference_agent, engine_dir=trt_engine_dir)
+            if trt_handler.is_available():
+                app.state.trt_handler = trt_handler
+                # Also attach to IMTalkerStreamer for WebRTC rendering acceleration
+                app.state.imtalker_streamer.trt_handler = trt_handler
+                print(f"✅ TensorRT Handler initialized with engines from {trt_engine_dir}")
+            else:
+                print(f"⚠️ TRT engines not found in {trt_engine_dir}. Running in PyTorch-only mode.")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize TRT Handler: {e}")
+            app.state.trt_handler = None
+    else:
+        print("TRTInferenceHandler not available. Running in PyTorch-only mode.")
     
     # Session management
     app.state.webrtc_sessions = {}
@@ -331,11 +358,17 @@ async def remove_avatar_voice(
 async def health():
     """Detailed health check."""
     stats = gpu_monitor.get_stats()
+    trt_handler = getattr(app.state, 'trt_handler', None)
     return {
         "status": "healthy" if hasattr(app.state, 'imtalker_streamer') else "unhealthy",
         "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "cpu",
         "cuda_available": torch.cuda.is_available(),
         "models_loaded": hasattr(app.state, 'imtalker_streamer'),
+        "trt_available": trt_handler.is_available() if trt_handler else False,
+        "trt_engines": {
+            "source_encoder": trt_handler.source_encoder is not None if trt_handler else False,
+            "audio_renderer": trt_handler.audio_renderer is not None if trt_handler else False,
+        },
         "gpu_memory": stats,
     }
 
@@ -1715,6 +1748,99 @@ class InferenceAgent:
             hls_generator.add_frame(f_np)
             frames += 1
         return frames
+
+    @torch.no_grad()
+    def run_trt_inference(self, trt_handler, img_pil, aud_path, crop, seed, nfe, cfg_scale):
+        """
+        Run inference using TensorRT-accelerated source encoder and audio renderer.
+        Motion generation remains in PyTorch. Falls back to PyTorch if TRT fails.
+        
+        Args:
+            trt_handler: TRTInferenceHandler instance
+            img_pil: PIL Image of the source face
+            aud_path: Path to driving audio file
+            crop: Whether to auto-crop the face
+            seed: Random seed for generation
+            nfe: Number of function evaluations (steps)
+            cfg_scale: Classifier-free guidance scale
+            
+        Returns:
+            Path to the output video file
+        """
+        torch.cuda.empty_cache()
+        print(f"[TRT InferenceAgent] Starting TensorRT-accelerated inference...")
+        t_start = time.time()
+        
+        try:
+            video_path = trt_handler.run_inference(img_pil, aud_path, crop, seed, nfe, cfg_scale)
+            t_total = time.time() - t_start
+            print(f"[TRT InferenceAgent] Completed in {t_total:.2f}s")
+            return video_path
+        except Exception as e:
+            print(f"[TRT InferenceAgent] TRT inference failed: {e}, falling back to PyTorch")
+            traceback.print_exc()
+            return self.run_audio_inference(img_pil, aud_path, crop, seed, nfe, cfg_scale)
+
+    @torch.no_grad()
+    def run_trt_inference_streaming(self, trt_handler, img_pil, aud_path, crop, seed, nfe, cfg_scale):
+        """
+        Run TRT-accelerated inference and yield frames one-by-one for streaming.
+        Uses TRT for source encoding and per-frame rendering, PyTorch for motion generation.
+        Falls back to PyTorch streaming if TRT fails.
+        
+        Yields:
+            torch.Tensor frames [1, 3, H, W]
+        """
+        torch.cuda.empty_cache()
+        print(f"[TRT Streaming] Starting TensorRT-accelerated streaming inference...")
+        
+        try:
+            # 1. Preprocessing
+            if crop:
+                img = self.data_processor.process_img(img_pil)
+            else:
+                img = img_pil.resize((self.opt.input_size, self.opt.input_size))
+            s_tensor = self.data_processor.transform(img).unsqueeze(0).to(self.device)
+            
+            # 2. Source Encoding (TensorRT)
+            enc_outputs = trt_handler.source_encoder.infer([s_tensor])
+            i_r = enc_outputs["i_r"]
+            t_r = enc_outputs["t_r"]
+            f_r = [enc_outputs[f"f_r_{i}"] for i in range(6)]
+            ma_r = [enc_outputs[f"ma_r_{i}"] for i in range(4)]
+            
+            # 3. Audio Processing & Motion Generation (PyTorch)
+            a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
+            data = {"s": s_tensor, "a": a_tensor, "pose": None, "cam": None, "gaze": None, "ref_x": t_r}
+            
+            torch.manual_seed(seed)
+            sample, _ = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+            
+            motion_scale = 0.6
+            sample = (1.0 - motion_scale) * t_r.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
+            
+            # 4. Rendering (TensorRT) — frame by frame
+            T = sample.shape[1]
+            print(f"[TRT Streaming] Rendering {T} frames via TensorRT...")
+            
+            for t in range(T):
+                motion_code = sample[:, t, ...]
+                trt_inputs = {"motion_code": motion_code, "i_r": i_r}
+                for idx in range(6):
+                    trt_inputs[f"f_r_{idx}"] = f_r[idx]
+                for idx in range(4):
+                    trt_inputs[f"ma_r_{idx}"] = ma_r[idx]
+                
+                out_dict = trt_handler.audio_renderer.infer(trt_inputs)
+                yield out_dict["output_image"].unsqueeze(0).cpu()
+                
+                if t % 20 == 0:
+                    torch.cuda.empty_cache()
+                    
+        except Exception as e:
+            print(f"[TRT Streaming] TRT streaming failed: {e}, falling back to PyTorch")
+            traceback.print_exc()
+            yield from self.run_audio_inference_streaming(img_pil, aud_path, crop, seed, nfe, cfg_scale)
 
 
 # --- Conversation Manager ---
@@ -3756,8 +3882,8 @@ def save_video(frames, fps, output_path):
     out.release()
     
 def process_frame_tensor(frame_tensor, format="BGR"):
-    # frame_tensor: [1, 3, H, W] or [3, H, W]
-    if frame_tensor.dim() == 4:
+    # frame_tensor: [1, 1, 3, H, W] or [1, 3, H, W] or [3, H, W]
+    while frame_tensor.dim() > 3:
         frame_tensor = frame_tensor.squeeze(0)
     
     # [3, H, W] -> [H, W, 3] -> [0, 255] uint8
@@ -4250,7 +4376,8 @@ async def api_audio_driven(
     cfg_scale: float = Form(2.0),
     crop_scale: float = Form(0.8),
     pose_style: Optional[str] = Form(None),
-    gaze_style: Optional[str] = Form(None)
+    gaze_style: Optional[str] = Form(None),
+    use_trt: bool = Form(False, description="Use TensorRT acceleration if available"),
 ):
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -4269,10 +4396,22 @@ async def api_audio_driven(
         gaze_arr = json.loads(gaze_style) if gaze_style else None
         
         try:
-            out_path = app.state.inference_agent.run_audio_inference(
-                img_pil, str(aud_path), crop, seed, nfe, cfg_scale,
-                pose_style=pose_arr, gaze_style=gaze_arr
-            )
+            # Use TRT if requested and available
+            trt_handler = getattr(app.state, 'trt_handler', None)
+            if use_trt and trt_handler and trt_handler.is_available():
+                logger.info("[/api/audio-driven] Using TensorRT-accelerated inference")
+                out_path = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    app.state.inference_agent.run_trt_inference,
+                    trt_handler, img_pil, str(aud_path), crop, seed, nfe, cfg_scale
+                )
+            else:
+                if use_trt:
+                    logger.warning("[/api/audio-driven] TRT requested but not available, falling back to PyTorch")
+                out_path = app.state.inference_agent.run_audio_inference(
+                    img_pil, str(aud_path), crop, seed, nfe, cfg_scale,
+                    pose_style=pose_arr, gaze_style=gaze_arr
+                )
         finally:
             dp.crop_scale = original_crop_scale
             
@@ -4311,6 +4450,68 @@ async def api_video_driven(
         return FileResponse(out_path, media_type="video/mp4")
     finally:
         shutil.rmtree(temp_dir)
+
+
+@app.post("/api/trt-inference")
+async def trt_inference(
+    image: UploadFile = File(..., description="Source image (PNG/JPG)"),
+    audio: UploadFile = File(..., description="Driving audio (WAV/MP3)"),
+    crop: bool = Form(True, description="Auto crop face"),
+    seed: int = Form(42, description="Random seed"),
+    nfe: int = Form(10, description="Steps"),
+    cfg_scale: float = Form(2.0, description="CFG Scale"),
+):
+    """
+    Run inference using the optimized TensorRT hybrid pipeline.
+    
+    Uses TensorRT engines for Source Encoder and Audio Renderer,
+    while running the Motion Generator in PyTorch. Offers significantly faster
+    inference speeds (up to 2x) compared to the standard PyTorch pipeline.
+    
+    Requires:
+    - TensorRT installed
+    - Built TRT engines in ./trt_engines/
+    """
+    trt_handler = getattr(app.state, 'trt_handler', None)
+    if trt_handler is None or not trt_handler.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="TensorRT Inference not available. Check server logs to see if engines were loaded correctly."
+        )
+    
+    temp_dir = Path(tempfile.mkdtemp())
+    try:
+        img_path = temp_dir / "source.png"
+        aud_path = temp_dir / "audio.wav"
+        with img_path.open("wb") as f: f.write(await image.read())
+        with aud_path.open("wb") as f: f.write(await audio.read())
+        
+        img_pil = Image.open(img_path).convert("RGB")
+        
+        logger.info(f"[TRT API] Starting TensorRT inference")
+        
+        # Run in threadpool to avoid blocking event loop
+        video_path = await asyncio.get_event_loop().run_in_executor(
+            None,
+            trt_handler.run_inference,
+            img_pil,
+            str(aud_path),
+            crop,
+            seed,
+            nfe,
+            cfg_scale
+        )
+        
+        logger.info(f"[TRT API] Success! Video saved to {video_path}")
+        return FileResponse(video_path, media_type="video/mp4", filename="output.mp4")
+        
+    except Exception as e:
+        logger.error(f"[TRT API] Error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        shutil.rmtree(temp_dir)
+
 
 @app.get("/api/hls/{session_id}/download")
 async def download_full_video(session_id: str):

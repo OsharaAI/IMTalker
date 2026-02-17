@@ -99,6 +99,9 @@ class IMTalkerStreamer:
         self.renderer.eval()
         self.generator.eval()
         
+        # TensorRT handler (set externally via app.state.imtalker_streamer.trt_handler)
+        self.trt_handler = None
+        
         # Audio Processor
         print(f"Loading Wav2Vec2 from {self.opt.wav2vec_model_path}")
         if os.path.exists(self.opt.wav2vec_model_path) and os.path.exists(
@@ -122,6 +125,13 @@ class IMTalkerStreamer:
         self._cached_t_lat = None
         self._cached_ta_r = None
         self._cached_m_r = None
+        
+        # TRT source encoder cache (avoids re-encoding per call)
+        self._trt_cache_key = None
+        self._cached_trt_i_r = None
+        self._cached_trt_t_r = None
+        self._cached_trt_f_r = None
+        self._cached_trt_ma_r = None
         
         # Optional: torch.compile (component-level for 25-30% speedup vs full-model 15-20%)
         if self.opt.use_compile and hasattr(torch, 'compile'):
@@ -255,6 +265,39 @@ class IMTalkerStreamer:
             self._cached_m_r = m_r
             print(f"[IMTalker] Cached avatar embeddings for {avatar_key[:8]}...")
         
+        # Check if TRT is available for accelerated rendering
+        use_trt = (self.trt_handler is not None 
+                   and self.trt_handler.is_available() 
+                   and self.trt_handler.audio_renderer is not None)
+        
+        # TRT source encoding cache
+        trt_i_r = trt_t_r = trt_f_r = trt_ma_r = None
+        if use_trt:
+            if avatar_key == self._trt_cache_key and self._cached_trt_i_r is not None:
+                trt_i_r = self._cached_trt_i_r
+                trt_t_r = self._cached_trt_t_r
+                trt_f_r = self._cached_trt_f_r
+                trt_ma_r = self._cached_trt_ma_r
+            else:
+                try:
+                    print(f"[IMTalker TRT] Running TRT source encoding for avatar {avatar_key[:8]}...")
+                    enc_outputs = self.trt_handler.source_encoder.infer([s_tensor])
+                    trt_i_r = enc_outputs["i_r"]
+                    trt_t_r = enc_outputs["t_r"]
+                    trt_f_r = [enc_outputs[f"f_r_{idx}"] for idx in range(6)]
+                    trt_ma_r = [enc_outputs[f"ma_r_{idx}"] for idx in range(4)]
+                    
+                    # Cache TRT outputs
+                    self._trt_cache_key = avatar_key
+                    self._cached_trt_i_r = trt_i_r
+                    self._cached_trt_t_r = trt_t_r
+                    self._cached_trt_f_r = trt_f_r
+                    self._cached_trt_ma_r = trt_ma_r
+                    print(f"[IMTalker TRT] Cached TRT source embeddings for {avatar_key[:8]}")
+                except Exception as e:
+                    print(f"[IMTalker TRT] Source encoding failed: {e}, falling back to PyTorch rendering")
+                    use_trt = False
+        
         torch.manual_seed(seed)
         
         total_gen_time = 0
@@ -306,6 +349,74 @@ class IMTalkerStreamer:
                 
                 T = sample.shape[1]
                 
+                # Render Frames — choose TRT or PyTorch path
+                # TRT rendering: per-frame TensorRT for source encoder + audio renderer
+                if use_trt:
+                    # TRT needs motion stabilization with trt_t_r
+                    motion_scale = 0.6
+                    sample_stabilized = (1.0 - motion_scale) * trt_t_r.unsqueeze(1).repeat(1, T, 1) + motion_scale * sample
+                    
+                    trt_frames = []
+                    yield_every = 5  # Yield every 5 frames for streaming latency
+                    trt_batch_start = time.time()
+                    
+                    for t in range(T):
+                        motion_code = sample_stabilized[:, t, ...]
+                        trt_inputs = {"motion_code": motion_code, "i_r": trt_i_r}
+                        for idx in range(6):
+                            trt_inputs[f"f_r_{idx}"] = trt_f_r[idx]
+                        for idx in range(4):
+                            trt_inputs[f"ma_r_{idx}"] = trt_ma_r[idx]
+                        
+                        try:
+                            out_dict = self.trt_handler.audio_renderer.infer(trt_inputs)
+                            trt_frames.append(out_dict["output_image"].unsqueeze(0).cpu())
+                        except Exception as e:
+                            if t == 0:
+                                print(f"[IMTalker TRT] Renderer failed at frame {t}: {e}, falling back to PyTorch for this chunk")
+                                use_trt = False
+                                break
+                            # For later frames, use last good frame
+                            trt_frames.append(trt_frames[-1])
+                        
+                        total_frames += 1
+                        
+                        # Yield incrementally for streaming
+                        if len(trt_frames) >= yield_every or t == T - 1:
+                            batch_video_dur = len(trt_frames) / self.opt.fps
+                            batch_render_time = time.time() - trt_batch_start
+                            metrics = {
+                                "chunk_id": i,
+                                "batch_id": t // yield_every,
+                                "generation_time": batch_render_time,
+                                "video_duration": batch_video_dur,
+                                "rtf": batch_render_time / batch_video_dur if batch_video_dur > 0 else 0,
+                                "num_frames": len(trt_frames),
+                                "is_first_batch": t < yield_every,
+                                "is_last_batch": t == T - 1,
+                                "total_chunk_frames": T,
+                                "renderer": "tensorrt",
+                            }
+                            yield trt_frames, metrics
+                            trt_frames = []
+                            trt_batch_start = time.time()
+                        
+                        if t % 20 == 0:
+                            torch.cuda.empty_cache()
+                    
+                    del sample_stabilized
+                    
+                    if use_trt:
+                        # Successfully rendered via TRT — skip PyTorch rendering
+                        del sample, input_values, data
+                        if torch.cuda.is_available() and i % 3 == 2:
+                            torch.cuda.empty_cache()
+                        chunk_gen_time = time.time() - chunk_start_time
+                        total_gen_time += chunk_gen_time
+                        continue
+                    # else: TRT failed at frame 0, fall through to PyTorch rendering below
+                
+                # PyTorch Rendering: Batched or Sequential
                 # Render Frames in Batches — yield INCREMENTALLY after each batch
                 # This is critical for real-time: first frames available in ~40ms instead of ~400ms
                 if self.opt.use_batching:
