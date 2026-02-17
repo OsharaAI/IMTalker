@@ -1,0 +1,78 @@
+{
+    "avatars": {
+        "assets/source_1.png": {
+            "name": "Modern Corporate",
+            "voice": "Olivia.wav",
+            "voice_type": "predefined",
+            "greeting": "Hi there! How are you doing today?"
+        },
+        "assets/source_2.png": {
+            "name": "Casual Creative",
+            "voice": "Emily.wav",
+            "voice_type": "predefined",
+            "greeting": "Hey! What's on your mind?"
+        },
+        "assets/source_3.jpg": {
+            "name": "Avatar 3",
+            "voice": "Adrian.wav",
+            "voice_type": "predefined",
+            "greeting": "Hello! How can I help you today?"
+        },
+        "assets/source_4.png": {
+            "name": "Avatar 4",
+            "voice": "Ryan.wav",
+            "voice_type": "predefined",
+            "greeting": "Hi there! What would you like to talk about?"
+        },
+        "assets/source_5.png": {
+            "name": "Avatar 5",
+            "voice": "Jade.wav",
+            "voice_type": "predefined",
+            "greeting": "Hello! Nice to meet you."
+        },
+        "assets/source_6.png": {
+            "name": "Avatar 6",
+            "voice": "Alexander.wav",
+            "voice_type": "predefined",
+            "greeting": "Hi! What can I do for you?"
+        },
+        "assets/source_7.png": {
+            "name": "Avatar 7",
+            "voice": "Layla.wav",
+            "voice_type": "predefined",
+            "greeting": "Hey there! How's it going?"
+        },
+        "assets/source_8.png": {
+            "name": "Avatar 8",
+            "voice": "Gabriel.wav",
+            "voice_type": "predefined",
+            "greeting": "Hello! Ready to chat?"
+        },
+        "assets/source_9.png": {
+            "name": "Avatar 9",
+            "voice": "Cora.wav",
+            "voice_type": "predefined",
+            "greeting": "Hi! How are you today?"
+        },
+        "assets/source_10.png": {
+            "name": "Avatar 10",
+            "voice": "Henry.wav",
+            "voice_type": "predefined",
+            "greeting": "Hello! What's going on?"
+        },
+        "assets/source_11.png": {
+            "name": "Avatar 11",
+            "voice": "Elena.wav",
+            "voice_type": "predefined",
+            "greeting": "Hi there! Let's talk."
+        },
+        "assets/chandler.jpg": {
+            "name": "Chandler",
+            "voice": "Michael.wav",
+            "voice_type": "predefined",
+            "greeting": "Could I BE any more ready to chat?"
+        }
+    },
+    "default_voice": "Olivia.wav",
+    "default_voice_type": "predefined"
+}

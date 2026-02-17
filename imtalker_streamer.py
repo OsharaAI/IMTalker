@@ -64,7 +64,7 @@ class IMTalkerConfig:
 
         # Optimization flags
         self.use_batching = False
-        self.batch_size = 15
+        self.batch_size = 10
         self.use_fp16 = False  # Disabled by default: causes NaN/Inf with IMTalker
         self.use_compile = True # Set to True if torch >= 2.0 and performance is critical
         
@@ -82,6 +82,12 @@ class IMTalkerStreamer:
             self.opt.device = "cuda" if torch.cuda.is_available() else "cpu"
             
         print(f"IMTalkerStreamer initializing on {self.opt.device}...")
+        
+        # GPU render lock: serializes all generate_stream() calls.
+        # The streamer is NOT thread-safe (shared GPU models, avatar cache,
+        # mutable state). Concurrent calls (e.g. idle render + greeting render)
+        # corrupt the pipeline and produce wrong/static frames.
+        self._gpu_lock = threading.Lock()
         
         # Load Models
         self.renderer = IMTRenderer(self.opt).to(self.opt.device)
@@ -205,7 +211,16 @@ class IMTalkerStreamer:
         """
         avatar_image: PIL Image
         audio_chunk_iterator: iterator yielding numpy arrays of audio (waveform)
+        
+        Thread-safe: acquires _gpu_lock for the entire generation. The lock is held
+        while yielding frames (generator protocol keeps the with-block active).
         """
+        with self._gpu_lock:
+            yield from self._generate_stream_unlocked(avatar_image, audio_chunk_iterator, seed, nfe, cfg_scale)
+
+    @torch.no_grad()
+    def _generate_stream_unlocked(self, avatar_image, audio_chunk_iterator, seed=42, nfe=10, cfg_scale=3.0):
+        """Internal unlocked implementation. Always call via generate_stream()."""
         
         # 1. Prepare Avatar — use cached embeddings if same avatar
         avatar_key = self._get_avatar_cache_key(avatar_image)
