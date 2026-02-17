@@ -4,50 +4,6 @@ import torch
 import torch.nn as nn
 from renderer.models import IMTRenderer
 
-class IMTRendererWrapper(nn.Module):
-    """
-    Wrapper to export IMTRenderer as a single ONNX model.
-    Inputs:
-        source_image: (1, 3, 512, 512)
-        driving_motion: (1, 32)
-    Outputs:
-        output_image: (1, 3, 512, 512)
-    """
-    def __init__(self, renderer):
-        super().__init__()
-        self.renderer = renderer
-
-    def forward(self, source_image, driving_motion):
-        # 1. Encode Source
-        f_r, i_r = self.renderer.app_encode(source_image)
-        t_r = self.renderer.mot_encode(source_image)
-        
-        # 2. Adapt Source Motion
-        ta_r = self.renderer.adapt(t_r, i_r)
-        
-        # 3. Decode Source Motion (Global Reference)
-        ma_r = self.renderer.mot_decode(ta_r)
-        
-        # 4. Adapt Driving Motion (we assume driving_motion is already encoded t_c)
-        # Wait, the Generator usually takes 'source_image' and 'driving_image' or 'driving_motion'.
-        # In inference_batch.py: 
-        #   t_c = self.gen.mot_encode(batch_tensor) -> but batch_tensor is driving_frame
-        #   ta_c = self.gen.adapt(t_c, i_r_batch)
-        #   ma_c = self.gen.mot_decode(ta_c)
-        #   out = self.gen.decode(ma_c, ma_r_batch, f_r_batch)
-        
-        # To make a monolithic export useful, we should probably input:
-        #   source_image (static, can be pre-computed but let's keep it simple first)
-        #   driving_image (1, 3, 512, 512)
-        
-        # Let's export the Full Pipeline: Source + Driving -> Output
-        # Inputs: source (1,3,H,W), driving (1,3,H,W)
-        pass
-
-    # Actually, for efficiency, we want to pre-compute Source Features once.
-    # So we should export 2 models:
-    # Model A: Source Encoder (Source -> f_r, i_r, ma_r) [Run Once]
-    # Model B: Driving Generator (Driving Image + f_r, i_r, ma_r -> Output) [Run Per Frame]
 
 class SourceEncoder(nn.Module):
     def __init__(self, renderer):

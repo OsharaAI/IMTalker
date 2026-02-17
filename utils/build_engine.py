@@ -38,7 +38,7 @@ def build_engine(onnx_file_path, engine_file_path, fp16=True):
         # For TensorRT 8.6+ / 10.x
         plan = builder.build_serialized_network(network, config)
         if plan is None:
-            print("ERROR: Failed to build serialzed network.")
+            print("ERROR: Failed to build serialized network.")
             return None
             
         with open(engine_file_path, "wb") as f:
