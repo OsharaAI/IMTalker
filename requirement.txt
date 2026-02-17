@@ -21,3 +21,4 @@ gradio==5.1.0
 gradio-client==1.4.0 
 fastapi==0.115.6 
 pydantic==2.10.4
+tensorrt

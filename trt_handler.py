@@ -1,15 +1,16 @@
-
 import tensorrt as trt
 import torch
 import numpy as np
 from collections import OrderedDict
 import os
 
+
 class TensorRTModel:
     """
     Generic TensorRT Model Wrapper for PyTorch.
     Handles engine loading, context creation, and inference.
     """
+
     def __init__(self, engine_path):
         self.engine_path = engine_path
         self.logger = trt.Logger(trt.Logger.WARNING)
@@ -17,21 +18,21 @@ class TensorRTModel:
         self.engine = self._load_engine()
         self.context = self.engine.create_execution_context()
         self.stream = torch.cuda.current_stream()
-        
+
         # Parse inputs and outputs
         self.inputs = []
         self.outputs = []
         self.bindings = []
-        
+
         # Keep references to input tensors to prevent GC during async execution
-        self.input_refs = [] 
+        self.input_refs = []
 
         for i in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(i)
             # dtype = self.engine.get_tensor_dtype(name) # Only available in recent TRT
             # shape = self.engine.get_tensor_shape(name)
             is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
-            
+
             if is_input:
                 self.inputs.append(name)
             else:
@@ -51,8 +52,8 @@ class TensorRTModel:
             Dictionary {name: tensor} of outputs.
         """
         self.bindings = []
-        self.input_refs = [] # Clear previous refs
-        
+        self.input_refs = []  # Clear previous refs
+
         # Handle dict input
         if isinstance(input_tensors, dict):
             # Sort inputs according to engine expectation
@@ -63,9 +64,11 @@ class TensorRTModel:
                 else:
                     raise ValueError(f"Missing input tensor: {name}")
             input_tensors = sorted_inputs
-            
+
         if len(input_tensors) != len(self.inputs):
-            raise ValueError(f"Expected {len(self.inputs)} inputs, got {len(input_tensors)}")
+            raise ValueError(
+                f"Expected {len(self.inputs)} inputs, got {len(input_tensors)}"
+            )
 
         # Bind inputs
         for i, tensor in enumerate(input_tensors):
@@ -73,8 +76,8 @@ class TensorRTModel:
             if not tensor.is_cuda:
                 tensor = tensor.cuda()
             tensor = tensor.contiguous()
-            self.input_refs.append(tensor) # Keep ref
-            
+            self.input_refs.append(tensor)  # Keep ref
+
             name = self.inputs[i]
             self.context.set_input_shape(name, tuple(tensor.shape))
             self.context.set_tensor_address(name, tensor.data_ptr())
@@ -84,14 +87,14 @@ class TensorRTModel:
         for name in self.outputs:
             shape = self.context.get_tensor_shape(name)
             # Handle dynamic shapes if needed (usually -1) - for now assume static or inferred
-            # If shape has -1, we might need to deduce it? 
+            # If shape has -1, we might need to deduce it?
             # In update, set_input_shape usually resolves output shapes.
-            
-            dtype = torch.float32 # Default, check engine if possible. 
+
+            dtype = torch.float32  # Default, check engine if possible.
             # For now assuming float32. Improved: check engine dtype if needed.
             # Most IMTalker models are float32/float16. PyTorch can allocate usually.
-            
-            tensor = torch.empty(tuple(shape), device='cuda', dtype=dtype)
+
+            tensor = torch.empty(tuple(shape), device="cuda", dtype=dtype)
             self.context.set_tensor_address(name, tensor.data_ptr())
             output_tensors[name] = tensor
 
@@ -101,28 +104,34 @@ class TensorRTModel:
 
         return output_tensors
 
+
 class TRTInferenceHandler:
     """
     High-level handler for IMTalker TensorRT inference.
     Manages SourceEncoder and AudioRenderer engines.
     """
+
     def __init__(self, agent, engine_dir="trt_engines"):
         self.agent = agent
         self.device = agent.device
         self.source_encoder = None
         self.audio_renderer = None
-        
+
+        if not os.path.isabs(engine_dir):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            engine_dir = os.path.join(base_dir, engine_dir)
+
         source_path = os.path.join(engine_dir, "source_encoder.trt")
         audio_path = os.path.join(engine_dir, "audio_renderer.trt")
-        
+
         if os.path.exists(source_path):
             print(f"Loading SourceEncoder from {source_path}...")
             self.source_encoder = TensorRTModel(source_path)
-            
+
         if os.path.exists(audio_path):
             print(f"Loading AudioRenderer from {audio_path}...")
             self.audio_renderer = TensorRTModel(audio_path)
-            
+
     def is_available(self):
         return self.source_encoder is not None and self.audio_renderer is not None
 
@@ -132,93 +141,102 @@ class TRTInferenceHandler:
             img = self.agent.data_processor.process_img(img_pil)
         else:
             img = img_pil.resize((self.agent.opt.input_size, self.agent.opt.input_size))
-            
+
         s_tensor = self.agent.data_processor.transform(img).unsqueeze(0).to(self.device)
-        
+
         # 2. Source Encoding (TensorRT)
         # Inputs: source_image
         # Outputs: i_r, t_r, f_r_0..5, ma_r_0..3
         print("Running Source Encoder (TRT)...")
         enc_outputs = self.source_encoder.infer([s_tensor])
-        
+
         # Extract outputs by name
         # Names are defined in export_onnx.py: i_r, t_r, f_r_0...
-        
-        i_r = enc_outputs['i_r']
-        t_r = enc_outputs['t_r']
-        
-        f_r = [enc_outputs[f'f_r_{i}'] for i in range(6)]
-        ma_r = [enc_outputs[f'ma_r_{i}'] for i in range(4)]
-        
+
+        i_r = enc_outputs["i_r"]
+        t_r = enc_outputs["t_r"]
+
+        f_r = [enc_outputs[f"f_r_{i}"] for i in range(6)]
+        ma_r = [enc_outputs[f"ma_r_{i}"] for i in range(4)]
+
         # 3. Audio Processing (PyTorch)
         # We need Motion Generator inputs.
         # Data preparation
         data = {
-            's': s_tensor,
-            'a': None, # Filled later
-            'pose': None,
-            'cam': None,
-            'gaze': None,
-            'ref_x': t_r # t_lat is ref_x
+            "s": s_tensor,
+            "a": None,  # Filled later
+            "pose": None,
+            "cam": None,
+            "gaze": None,
+            "ref_x": t_r,  # t_lat is ref_x
         }
-        
+
         # Process Audio
-        a_tensor = self.agent.data_processor.process_audio(audio_path).unsqueeze(0).to(self.device)
-        data['a'] = a_tensor
-        
+        a_tensor = (
+            self.agent.data_processor.process_audio(audio_path)
+            .unsqueeze(0)
+            .to(self.device)
+        )
+        data["a"] = a_tensor
+
         # 4. Motion Generation (PyTorch)
         # This part is complex and uses the Generator model which is not exported yet effectively.
         # We use the existing PyTorch Generator for this step.
         print("Generating Motion (PyTorch)...")
         if seed is not None:
             torch.manual_seed(seed)
-        
+
         # NOTE: generator.sample returns (sample, context)
-        sample, _ = self.agent.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
-        
+        sample, _ = self.agent.generator.sample(
+            data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed
+        )
+
         # Stabilization (Standard logic)
         motion_scale = 0.6
-        sample = (1.0 - motion_scale) * t_r.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
-        
+        sample = (1.0 - motion_scale) * t_r.unsqueeze(1).repeat(
+            1, sample.shape[1], 1
+        ) + motion_scale * sample
+
         # 5. Rendering (TensorRT)
         # Loop mainly due to memory or structure, but AudioRenderer takes ONE frame motion code?
         # No, AudioRenderer in ONNX export (AudioRenderer class) takes:
         # (motion_code, i_r, f_r..., ma_r...) -> output_image
-        
+
         # We need to run this for every frame t in sample.
         T = sample.shape[1]
         print(f"Rendering {T} frames (TRT)...")
-        
+
         import time
         from tqdm import tqdm
-        
+
         frames = []
         t_render_start = time.time()
-        
+
         for t in tqdm(range(T), desc="Rendering", unit="frame"):
-            motion_code = sample[:, t, ...] # (1, 32)
-            
+            motion_code = sample[:, t, ...]  # (1, 32)
+
             # Inputs: motion_code, i_r, f_r_0..5, ma_r_0..3
             # We must pass them as list or dict.
-            trt_inputs = {
-                'motion_code': motion_code,
-                'i_r': i_r
-            }
-            for i in range(6): trt_inputs[f'f_r_{i}'] = f_r[i]
-            for i in range(4): trt_inputs[f'ma_r_{i}'] = ma_r[i]
-            
+            trt_inputs = {"motion_code": motion_code, "i_r": i_r}
+            for i in range(6):
+                trt_inputs[f"f_r_{i}"] = f_r[i]
+            for i in range(4):
+                trt_inputs[f"ma_r_{i}"] = ma_r[i]
+
             out_dict = self.audio_renderer.infer(trt_inputs)
-            out_frame = out_dict['output_image']
-            
+            out_frame = out_dict["output_image"]
+
             frames.append(out_frame.cpu())
-        
+
         t_render_end = time.time()
         render_time = t_render_end - t_render_start
         render_fps = T / render_time if render_time > 0 else 0
-        print(f"Rendering completed: {render_fps:.2f} fps ({render_time:.2f}s for {T} frames)")
+        print(
+            f"Rendering completed: {render_fps:.2f} fps ({render_time:.2f}s for {T} frames)"
+        )
 
         # 6. Post-processing & Saving (PyTorch)
-        vid_tensor = torch.stack(frames, dim=1).squeeze(0) # (T, 3, H, W)
-        
+        vid_tensor = torch.stack(frames, dim=1).squeeze(0)  # (T, 3, H, W)
+
         # Use existing save_video
         return self.agent.save_video(vid_tensor, self.agent.opt.fps, audio_path)

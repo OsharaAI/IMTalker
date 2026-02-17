@@ -1,7 +1,12 @@
 import argparse
 import os
+import sys
 import torch
 import torch.nn as nn
+
+# Add parent directory to path so we can import renderer module
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 from renderer.models import IMTRenderer
 
 
