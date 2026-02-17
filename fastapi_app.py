@@ -952,7 +952,8 @@ async def startup_event():
             if TRTInferenceHandler is not None:
                 global trt_handler
                 try:
-                    trt_handler = TRTInferenceHandler(agent)
+                    trt_engine_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trt_engines")
+                    trt_handler = TRTInferenceHandler(agent, engine_dir=trt_engine_dir)
                 except Exception as e:
                     print(f"Failed to initialize TRT Handler: {e}")
                     trt_handler = None
