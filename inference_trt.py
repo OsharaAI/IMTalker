@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import psutil
+from torchvision import transforms
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -95,10 +96,28 @@ def main():
     with torch.inference_mode():
         # Re-implementing logic with metrics:
         t_prep_start = time.time()
+        # Preprocess Image
         if args.crop:
             img = agent.data_processor.process_img(img_pil)
+            full_img_pil = None
+            coords = None
+            full_img_tensor = None
         else:
-            img = img_pil.resize((agent.opt.input_size, agent.opt.input_size))
+            # Crop-Infer-Paste Logic:
+            img_arr = np.array(img_pil)
+            if img_arr.ndim == 2: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+            elif img_arr.shape[2] == 4: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+            
+            x1, y1, x2, y2 = agent.data_processor.get_crop_coords(img_arr)
+            coords = (x1, y1, x2, y2)
+            
+            crop_img = img_arr[y1:y2, x1:x2]
+            crop_pil = Image.fromarray(crop_img).resize((agent.opt.input_size, agent.opt.input_size))
+            img = crop_pil
+            full_img_pil = img_pil
+            
+            # Prepare full image tensor on GPU for paste-back
+            full_img_tensor = transforms.ToTensor()(img_pil).to(agent.device)
                 
         s_tensor = agent.data_processor.transform(img).unsqueeze(0).to(agent.device)
         t_prep_end = time.time()
@@ -159,7 +178,13 @@ def main():
             out_dict = trt_handler.audio_renderer.infer(trt_inputs)
             out_frame = out_dict['output_image']
             
-            frames.append(out_frame.cpu())
+            # Post-processing (Paste Back)
+            if not args.crop:
+                # GPU Paste Back
+                full_frame = agent.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
+                frames.append(full_frame.unsqueeze(0).cpu())
+            else:
+                frames.append(out_frame.cpu())
             pbar.update(1)
             
         pbar.close()

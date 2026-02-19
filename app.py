@@ -73,11 +73,10 @@ def ensure_checkpoints():
             pass
 
 
-ensure_checkpoints()
-
 
 class AppConfig:
     def __init__(self):
+        ensure_checkpoints()
         # Auto-detect device
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Running on device: {self.device}")
@@ -203,13 +202,13 @@ class DataProcessor:
         self.transform = transforms.Compose(
             [transforms.Resize((512, 512)), transforms.ToTensor()]
         )
+        self.blend_mask = None
 
-    def process_img(self, img: Image.Image) -> Image.Image:
-        img_arr = np.array(img)
-        if img_arr.ndim == 2:
-            img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
-        elif img_arr.shape[2] == 4:
-            img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+    def get_crop_coords(self, img_arr):
+        """
+        Calculate face crop coordinates.
+        Returns: (x1, y1, x2, y2)
+        """
         h, w = img_arr.shape[:2]
         try:
             bboxes = self.fa.face_detector.detect_from_image(img_arr)
@@ -218,6 +217,7 @@ class DataProcessor:
         except Exception as e:
             print(f"Face detection failed: {e}")
             bboxes = None
+            
         valid_bboxes = []
         if bboxes is not None:
             valid_bboxes = [
@@ -225,6 +225,7 @@ class DataProcessor:
                 for (x1, y1, x2, y2, score) in bboxes
                 if score > 0.5
             ]
+            
         if not valid_bboxes:
             print("Warning: No face detected. Using center crop.")
             cx, cy = w // 2, h // 2
@@ -242,6 +243,8 @@ class DataProcessor:
             y1_new = cy - half_side
             x2_new = cx + half_side
             y2_new = cy + half_side
+            
+            # Padding checks
             if x1_new < 0:
                 x2_new += 0 - x1_new
                 x1_new = 0
@@ -254,18 +257,176 @@ class DataProcessor:
             if y2_new > h:
                 y1_new -= y2_new - h
                 y2_new = h
+                
             x1_new = max(0, x1_new)
             y1_new = max(0, y1_new)
             x2_new = min(w, x2_new)
             y2_new = min(h, y2_new)
+            
             curr_w = x2_new - x1_new
             curr_h = y2_new - y1_new
             min_side = min(curr_w, curr_h)
             x2_new = x1_new + min_side
             y2_new = y1_new + min_side
-        crop_img = img_arr[int(y1_new) : int(y2_new), int(x1_new) : int(x2_new)]
+            
+        return int(x1_new), int(y1_new), int(x2_new), int(y2_new)
+
+    def process_img(self, img: Image.Image) -> Image.Image:
+        img_arr = np.array(img)
+        if img_arr.ndim == 2:
+            img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+        elif img_arr.shape[2] == 4:
+            img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+            
+        x1, y1, x2, y2 = self.get_crop_coords(img_arr)
+        crop_img = img_arr[y1:y2, x1:x2]
         crop_pil = Image.fromarray(crop_img)
         return crop_pil.resize((self.opt.input_size, self.opt.input_size))
+
+    def paste_back(self, face_img: torch.Tensor, full_img: Image.Image, coords):
+        """
+        Paste 512x512 face tensor back into full image PIL.
+        """
+        x1, y1, x2, y2 = coords
+        w_crop = x2 - x1
+        h_crop = y2 - y1
+        
+        # Convert tensor to PIL
+        if isinstance(face_img, torch.Tensor):
+            if face_img.dim() == 4:
+                face_img = face_img.squeeze(0)
+            face_img = face_img.permute(1, 2, 0).cpu().numpy()
+            face_img = np.clip(face_img * 255, 0, 255).astype(np.uint8)
+            face_pil = Image.fromarray(face_img)
+        else:
+            face_pil = face_img
+            
+        # Resize back to crop size
+        face_resized = face_pil.resize((w_crop, h_crop), Image.LANCZOS)
+        
+        # Paste
+        full_img_copy = full_img.copy()
+        full_img_copy.paste(face_resized, (x1, y1))
+        
+        return full_img_copy
+
+    def paste_back_tensor(self, face_tensor: torch.Tensor, full_img_tensor: torch.Tensor, coords):
+        """
+        Paste 512x512 face tensor back into full image tensor on GPU with soft blending.
+        Args:
+            face_tensor: (1, 3, 512, 512) or (3, 512, 512)
+            full_img_tensor: (1, 3, H, W) or (3, H, W)
+            coords: (x1, y1, x2, y2)
+        Returns:
+            Combined tensor (same shape as full_img_tensor)
+        """
+        if face_tensor.dim() == 4:
+            face_tensor = face_tensor.squeeze(0)
+        
+        was_4d = False
+        if full_img_tensor.dim() == 4:
+            full_img_tensor = full_img_tensor.squeeze(0)
+            was_4d = True
+            
+        x1, y1, x2, y2 = coords
+        w_crop = x2 - x1
+        h_crop = y2 - y1
+        
+        # Resize face tensor to target crop size using interpolation
+        # F.interpolate expects 4D input (N, C, H, W)
+        face_resized = torch.nn.functional.interpolate(
+            face_tensor.unsqueeze(0), 
+            size=(h_crop, w_crop), 
+            mode='bilinear', 
+            align_corners=False
+        ).squeeze(0)
+        
+        # Clone full image to avoid modifying original
+        combined = full_img_tensor.clone()
+        
+        # Paste
+        # Check boundaries to be safe
+        h_full, w_full = combined.shape[1], combined.shape[2]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(w_full, x1 + face_resized.shape[2])
+        y2 = min(h_full, y1 + face_resized.shape[1])
+        
+        # Adjust face_resized if boundaries clipped (rare but possible)
+        h_paste = y2 - y1
+        w_paste = x2 - x1
+        
+        # Generate Blend Mask (lazy init)
+        if self.blend_mask is None:
+            # Create a 512x512 mask with soft edges (simulating crop feathering)
+            # Distance from edge
+            try:
+                # Meshgrid order varies by version, indexing='ij' is standard for matrix
+                Y, X = torch.meshgrid(torch.arange(512), torch.arange(512), indexing='ij')
+            except TypeError:
+                # Fallback for older torch
+                Y, X = torch.meshgrid(torch.arange(512), torch.arange(512))
+                
+            dist_x = torch.min(X, 511 - X)
+            dist_y = torch.min(Y, 511 - Y)
+            dist = torch.min(dist_x, dist_y).float()
+            
+            # Feathering margin (pixels in 512 domain)
+            margin = 32.0 
+            mask = torch.clamp(dist / margin, 0.0, 1.0)
+            self.blend_mask = mask.unsqueeze(0).unsqueeze(0) # (1, 1, 512, 512)
+            
+        if self.blend_mask.device != face_tensor.device:
+            self.blend_mask = self.blend_mask.to(face_tensor.device)
+            
+        # Resize mask to crop size
+        mask_resized = torch.nn.functional.interpolate(
+            self.blend_mask,
+            size=(h_crop, w_crop),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0) # (1, h_crop, w_crop)
+        
+        # Get regions
+        full_region = combined[:, y1:y2, x1:x2]
+        face_region = face_resized[:, :h_paste, :w_paste]
+        mask_region = mask_resized[:, :h_paste, :w_paste]
+        
+        # Blend: face * mask + full * (1 - mask)
+        blended = face_region * mask_region + full_region * (1.0 - mask_region)
+        
+        combined[:, y1:y2, x1:x2] = blended
+        
+        if was_4d:
+            combined = combined.unsqueeze(0)
+        
+        return combined
+
+    def resize_with_pad(self, img: Image.Image) -> Image.Image:
+        """
+        Resize image to target size (input_size x input_size) while maintaining aspect ratio.
+        Pads with black borders.
+        """
+        target_size = self.opt.input_size
+        img_arr = np.array(img)
+        h, w = img_arr.shape[:2]
+        
+        scale = target_size / max(h, w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        # Resize using PIL for better quality
+        img_resized = img.resize((new_w, new_h), Image.LANCZOS)
+        
+        # Create black background
+        new_img = Image.new("RGB", (target_size, target_size), (0, 0, 0))
+        
+        # Paste centered
+        paste_x = (target_size - new_w) // 2
+        paste_y = (target_size - new_h) // 2
+        new_img.paste(img_resized, (paste_x, paste_y))
+        
+        return new_img
 
     def process_audio(self, path: str) -> torch.Tensor:
         speech_array, sampling_rate = librosa.load(path, sr=self.sampling_rate)
@@ -619,187 +780,189 @@ class InferenceAgent:
         return self.save_video(vid_tensor, fps=fps, audio_path=driving_video_path)
 
 
-print("Initializing Configuration...")
-cfg = AppConfig()
 agent = None
 
-try:
-    if os.path.exists(cfg.renderer_path) and os.path.exists(cfg.generator_path):
-        agent = InferenceAgent(cfg)
-    else:
-        print(
-            "Error: Checkpoints not found. They should have been downloaded automatically."
-        )
-        # Try again if download just happened
-        if os.path.exists(cfg.renderer_path):
-            agent = InferenceAgent(cfg)
-except Exception as e:
-    print(f"Initialization Error: {e}")
-    import traceback
-
-    traceback.print_exc()
-
-
-def fn_audio_driven(image, audio, crop, seed, nfe, cfg_scale, progress=gr.Progress()):
-    if agent is None:
-        raise gr.Error("Models not loaded properly. Check logs.")
-    if image is None or audio is None:
-        raise gr.Error("Missing image or audio.")
-
-    img_pil = Image.fromarray(image).convert("RGB")
-    try:
-        return agent.run_audio_inference(
-            img_pil, audio, crop, int(seed), int(nfe), float(cfg_scale)
-        )
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise gr.Error(f"Error: {e}")
-
-
-def fn_video_driven(source_image, driving_video, crop, progress=gr.Progress()):
-    if agent is None:
-        raise gr.Error("Models not loaded properly. Check logs.")
-    if source_image is None or driving_video is None:
-        raise gr.Error("Missing inputs.")
-
-    img_pil = Image.fromarray(source_image).convert("RGB")
-    try:
-        return agent.run_video_inference(img_pil, driving_video, crop)
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise gr.Error(f"Error: {e}")
-
-
-# Gradio Interface
-with gr.Blocks(title="IMTalker Demo") as demo:
-    gr.Markdown("# 🗣️ IMTalker: Efficient Audio-driven Talking Face Generation")
-
-    with gr.Accordion("💡 Best Practices (Click to read)", open=False):
-        gr.Markdown(
-            """
-        To obtain the highest quality generation results, we recommend following these guidelines:
-
-        1.  **Input Image Composition**: 
-            Please ensure the input image features the person's head as the primary subject. Since our model is explicitly trained on facial data, it does not support full-body video generation. 
-            * The inference pipeline automatically **crops the input image** to focus on the face by default.
-            * **Note on Resolution**: The model generates video at a fixed resolution of **512×512**. Using extremely high-resolution inputs will result in downscaling, so prioritize facial clarity over raw image dimensions.
-
-        2.  **Audio Selection**: 
-            Our model was trained primarily on **English datasets**. Consequently, we recommend using **English audio** inputs to achieve the best lip-synchronization performance and naturalness.
-
-        3.  **Background Quality**: 
-            We strongly recommend using source images with **solid colored** or **blurred (bokeh)** backgrounds. Complex or highly detailed backgrounds may lead to visual artifacts or jitter in the generated video.
-        """
-        )
-
-    with gr.Tabs():
-        # ==========================
-        # Tab 1: Audio Driven
-        # ==========================
-        with gr.TabItem("Audio Driven"):
-            with gr.Row():
-                with gr.Column():
-                    a_img = gr.Image(
-                        label="Source Image", type="numpy", height=512, width=512
-                    )
-
-                    gr.Examples(
-                        examples=[
-                            ["assets/source_1.png"],
-                            ["assets/source_2.png"],
-                            ["assets/source_3.jpg"],
-                            ["assets/source_4.png"],
-                            ["assets/source_5.png"],
-                            ["assets/source_6.png"],
-                        ],
-                        inputs=[a_img],
-                        label="Example Images",
-                        cache_examples=False,
-                    )
-
-                    a_aud = gr.Audio(label="Driving Audio", type="filepath")
-
-                    gr.Examples(
-                        examples=[
-                            ["assets/audio_1.wav"],
-                            ["assets/audio_2.wav"],
-                            ["assets/audio_3.wav"],
-                            ["assets/audio_4.wav"],
-                            ["assets/audio_5.wav"],
-                        ],
-                        inputs=[a_aud],
-                        label="Example Audios",
-                        cache_examples=False,
-                    )
-
-                    with gr.Accordion("Settings", open=True):
-                        a_crop = gr.Checkbox(label="Auto Crop Face", value=False)
-                        a_seed = gr.Number(label="Seed", value=42)
-                        a_nfe = gr.Slider(5, 50, value=10, step=1, label="Steps (NFE)")
-                        a_cfg = gr.Slider(1.0, 5.0, value=2.0, label="CFG Scale")
-
-                    a_btn = gr.Button("Generate (Audio Driven)", variant="primary")
-
-                with gr.Column():
-                    a_out = gr.Video(label="Result", height=512, width=512)
-
-            a_btn.click(
-                fn_audio_driven, [a_img, a_aud, a_crop, a_seed, a_nfe, a_cfg], a_out
-            )
-
-        # ==========================
-        # Tab 2: Video Driven
-        # ==========================
-        with gr.TabItem("Video Driven"):
-            with gr.Row():
-                with gr.Column():
-                    v_img = gr.Image(
-                        label="Source Image", type="numpy", height=512, width=512
-                    )
-
-                    gr.Examples(
-                        examples=[
-                            ["assets/source_7.png"],
-                            ["assets/source_8.png"],
-                            ["assets/source_9.png"],
-                            ["assets/source_10.png"],
-                            ["assets/source_11.png"],
-                        ],
-                        inputs=[v_img],
-                        label="Example Images",
-                        cache_examples=False,
-                    )
-
-                    v_vid = gr.Video(
-                        label="Driving Video", sources=["upload"], height=512, width=512
-                    )
-
-                    gr.Examples(
-                        examples=[
-                            ["assets/driving_1.mp4"],
-                            ["assets/driving_2.mp4"],
-                            ["assets/driving_3.mp4"],
-                            ["assets/driving_4.mp4"],
-                            ["assets/driving_5.mp4"],
-                        ],
-                        inputs=[v_vid],
-                        label="Example Videos",
-                        cache_examples=False,
-                    )
-
-                    v_crop = gr.Checkbox(
-                        label="Auto Crop (Both Source & Driving)", value=False
-                    )
-                    v_btn = gr.Button("Generate (Video Driven)", variant="primary")
-
-                with gr.Column():
-                    v_out = gr.Video(label="Result", height=512, width=512)
-
-            v_btn.click(fn_video_driven, [v_img, v_vid, v_crop], v_out)
-
 if __name__ == "__main__":
-    demo.launch(share=False)
+    print("Initializing Configuration...")
+    cfg = AppConfig()
+
+    try:
+        if os.path.exists(cfg.renderer_path) and os.path.exists(cfg.generator_path):
+            agent = InferenceAgent(cfg)
+        else:
+            print(
+                "Error: Checkpoints not found. They should have been downloaded automatically."
+            )
+            # Try again if download just happened
+            if os.path.exists(cfg.renderer_path):
+                agent = InferenceAgent(cfg)
+    except Exception as e:
+        print(f"Initialization Error: {e}")
+        import traceback
+    
+        traceback.print_exc()
+    
+    
+    def fn_audio_driven(image, audio, crop, seed, nfe, cfg_scale, progress=gr.Progress()):
+        if agent is None:
+            raise gr.Error("Models not loaded properly. Check logs.")
+        if image is None or audio is None:
+            raise gr.Error("Missing image or audio.")
+    
+        img_pil = Image.fromarray(image).convert("RGB")
+        try:
+            return agent.run_audio_inference(
+                img_pil, audio, crop, int(seed), int(nfe), float(cfg_scale)
+            )
+        except Exception as e:
+            import traceback
+    
+            traceback.print_exc()
+            raise gr.Error(f"Error: {e}")
+    
+    
+    def fn_video_driven(source_image, driving_video, crop, progress=gr.Progress()):
+        if agent is None:
+            raise gr.Error("Models not loaded properly. Check logs.")
+        if source_image is None or driving_video is None:
+            raise gr.Error("Missing inputs.")
+    
+        img_pil = Image.fromarray(source_image).convert("RGB")
+        try:
+            return agent.run_video_inference(img_pil, driving_video, crop)
+        except Exception as e:
+            import traceback
+    
+            traceback.print_exc()
+            raise gr.Error(f"Error: {e}")
+    
+    
+    # Gradio Interface
+    with gr.Blocks(title="IMTalker Demo") as demo:
+        gr.Markdown("# 🗣️ IMTalker: Efficient Audio-driven Talking Face Generation")
+    
+        with gr.Accordion("💡 Best Practices (Click to read)", open=False):
+            gr.Markdown(
+                """
+            To obtain the highest quality generation results, we recommend following these guidelines:
+    
+            1.  **Input Image Composition**: 
+                Please ensure the input image features the person's head as the primary subject. Since our model is explicitly trained on facial data, it does not support full-body video generation. 
+                * The inference pipeline automatically **crops the input image** to focus on the face by default.
+                * **Note on Resolution**: The model generates video at a fixed resolution of **512×512**. Using extremely high-resolution inputs will result in downscaling, so prioritize facial clarity over raw image dimensions.
+    
+            2.  **Audio Selection**: 
+                Our model was trained primarily on **English datasets**. Consequently, we recommend using **English audio** inputs to achieve the best lip-synchronization performance and naturalness.
+    
+            3.  **Background Quality**: 
+                We strongly recommend using source images with **solid colored** or **blurred (bokeh)** backgrounds. Complex or highly detailed backgrounds may lead to visual artifacts or jitter in the generated video.
+            """
+            )
+    
+        with gr.Tabs():
+            # ==========================
+            # Tab 1: Audio Driven
+            # ==========================
+            with gr.TabItem("Audio Driven"):
+                with gr.Row():
+                    with gr.Column():
+                        a_img = gr.Image(
+                            label="Source Image", type="numpy", height=512, width=512
+                        )
+    
+                        gr.Examples(
+                            examples=[
+                                ["assets/source_1.png"],
+                                ["assets/source_2.png"],
+                                ["assets/source_3.jpg"],
+                                ["assets/source_4.png"],
+                                ["assets/source_5.png"],
+                                ["assets/source_6.png"],
+                            ],
+                            inputs=[a_img],
+                            label="Example Images",
+                            cache_examples=False,
+                        )
+    
+                        a_aud = gr.Audio(label="Driving Audio", type="filepath")
+    
+                        gr.Examples(
+                            examples=[
+                                ["assets/audio_1.wav"],
+                                ["assets/audio_2.wav"],
+                                ["assets/audio_3.wav"],
+                                ["assets/audio_4.wav"],
+                                ["assets/audio_5.wav"],
+                            ],
+                            inputs=[a_aud],
+                            label="Example Audios",
+                            cache_examples=False,
+                        )
+    
+                        with gr.Accordion("Settings", open=True):
+                            a_crop = gr.Checkbox(label="Auto Crop Face", value=False)
+                            a_seed = gr.Number(label="Seed", value=42)
+                            a_nfe = gr.Slider(5, 50, value=10, step=1, label="Steps (NFE)")
+                            a_cfg = gr.Slider(1.0, 5.0, value=2.0, label="CFG Scale")
+    
+                        a_btn = gr.Button("Generate (Audio Driven)", variant="primary")
+    
+                    with gr.Column():
+                        a_out = gr.Video(label="Result", height=512, width=512)
+    
+                a_btn.click(
+                    fn_audio_driven, [a_img, a_aud, a_crop, a_seed, a_nfe, a_cfg], a_out
+                )
+    
+            # ==========================
+            # Tab 2: Video Driven
+            # ==========================
+            with gr.TabItem("Video Driven"):
+                with gr.Row():
+                    with gr.Column():
+                        v_img = gr.Image(
+                            label="Source Image", type="numpy", height=512, width=512
+                        )
+    
+                        gr.Examples(
+                            examples=[
+                                ["assets/source_7.png"],
+                                ["assets/source_8.png"],
+                                ["assets/source_9.png"],
+                                ["assets/source_10.png"],
+                                ["assets/source_11.png"],
+                            ],
+                            inputs=[v_img],
+                            label="Example Images",
+                            cache_examples=False,
+                        )
+    
+                        v_vid = gr.Video(
+                            label="Driving Video", sources=["upload"], height=512, width=512
+                        )
+    
+                        gr.Examples(
+                            examples=[
+                                ["assets/driving_1.mp4"],
+                                ["assets/driving_2.mp4"],
+                                ["assets/driving_3.mp4"],
+                                ["assets/driving_4.mp4"],
+                                ["assets/driving_5.mp4"],
+                            ],
+                            inputs=[v_vid],
+                            label="Example Videos",
+                            cache_examples=False,
+                        )
+    
+                        v_crop = gr.Checkbox(
+                            label="Auto Crop (Both Source & Driving)", value=False
+                        )
+                        v_btn = gr.Button("Generate (Video Driven)", variant="primary")
+    
+                    with gr.Column():
+                        v_out = gr.Video(label="Result", height=512, width=512)
+    
+                v_btn.click(fn_video_driven, [v_img, v_vid, v_crop], v_out)
+    
+    if __name__ == "__main__":
+        demo.launch(share=False)
