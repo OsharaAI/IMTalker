@@ -3,7 +3,9 @@ import torch
 import numpy as np
 from collections import OrderedDict
 import os
-
+import cv2
+from PIL import Image
+import torchvision.transforms as transforms
 
 class TensorRTModel:
     """
@@ -139,9 +141,23 @@ class TRTInferenceHandler:
         # 1. Preprocessing (PyTorch)
         if crop:
             img = self.agent.data_processor.process_img(img_pil)
+            full_img_tensor = None
+            coords = None
         else:
-            img = img_pil.resize((self.agent.opt.input_size, self.agent.opt.input_size))
-
+            # Crop-Infer-Paste Logic
+            img_arr = np.array(img_pil)
+            if img_arr.ndim == 2: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+            elif img_arr.shape[2] == 4: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+            
+            x1, y1, x2, y2 = self.agent.data_processor.get_crop_coords(img_arr)
+            coords = (x1, y1, x2, y2)
+            
+            crop_img = img_arr[y1:y2, x1:x2]
+            img = Image.fromarray(crop_img).resize((self.agent.opt.input_size, self.agent.opt.input_size))
+            
+            # Prepare full image tensor on GPU for paste-back
+            full_img_tensor = transforms.ToTensor()(img_pil).to(self.device).unsqueeze(0)
+            
         s_tensor = self.agent.data_processor.transform(img).unsqueeze(0).to(self.device)
 
         # 2. Source Encoding (TensorRT)
@@ -224,8 +240,14 @@ class TRTInferenceHandler:
                 trt_inputs[f"ma_r_{i}"] = ma_r[i]
 
             out_dict = self.audio_renderer.infer(trt_inputs)
-            out_frame = out_dict["output_image"]
-
+            out_frame = out_dict['output_image']
+            
+            if full_img_tensor is not None:
+                # Need to handle dimensions carefully. TRT output is typical (1, 3, 512, 512).
+                # paste_back_tensor expects (1, 3, 512, 512) for face and (1, 3, H, W) for full.
+                # It handles it.
+                out_frame = self.agent.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
+            
             frames.append(out_frame.cpu())
 
         t_render_end = time.time()

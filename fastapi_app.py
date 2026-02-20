@@ -479,7 +479,25 @@ class InferenceAgent:
     @torch.no_grad()
     def run_audio_inference_streaming(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
         """Stream frames as they are generated for audio-driven inference."""
-        s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((self.opt.input_size, self.opt.input_size))
+        if crop:
+            s_pil = self.data_processor.process_img(img_pil)
+            full_img_tensor = None
+            coords = None
+        else:
+            # Crop-Infer-Paste Logic
+            img_arr = np.array(img_pil)
+            if img_arr.ndim == 2: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+            elif img_arr.shape[2] == 4: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+            
+            x1, y1, x2, y2 = self.data_processor.get_crop_coords(img_arr)
+            coords = (x1, y1, x2, y2)
+            
+            crop_img = img_arr[y1:y2, x1:x2]
+            s_pil = Image.fromarray(crop_img).resize((self.opt.input_size, self.opt.input_size))
+            
+            # Prepare full image tensor on GPU for paste-back
+            full_img_tensor = transforms.ToTensor()(img_pil).to(self.device).unsqueeze(0)
+
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
         data = {'s': s_tensor, 'a': a_tensor, 'pose': None, 'cam': None, 'gaze': None, 'ref_x': None}
@@ -489,6 +507,10 @@ class InferenceAgent:
         data['ref_x'] = t_lat
         torch.manual_seed(seed)
         sample = self.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+        # Stabilization
+        motion_scale = 0.6
+        sample = (1.0 - motion_scale) * t_lat.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
+        
         T = sample.shape[1]
         ta_r = self.renderer.adapt(t_lat, g_r)
         m_r = self.renderer.latent_token_decoder(ta_r)
@@ -498,6 +520,11 @@ class InferenceAgent:
             ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
             m_c = self.renderer.latent_token_decoder(ta_c)
             out_frame = self.renderer.decode(m_c, m_r, f_r)
+            
+            if full_img_tensor is not None:
+                # GPU Paste Back
+                out_frame = self.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
+                
             yield out_frame.squeeze(0)  # Yield single frame tensor (C, H, W)
 
     @torch.no_grad()
@@ -521,11 +548,25 @@ class InferenceAgent:
         elif self.device == "cuda":
             torch.cuda.empty_cache()
 
-        s_pil = (
-            self.data_processor.process_img(img_pil)
-            if crop
-            else img_pil.resize((self.opt.input_size, self.opt.input_size))
-        )
+        if crop:
+            s_pil = self.data_processor.process_img(img_pil)
+            full_img_tensor = None
+            coords = None
+        else:
+            # Crop-Infer-Paste Logic
+            img_arr = np.array(img_pil)
+            if img_arr.ndim == 2: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+            elif img_arr.shape[2] == 4: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+            
+            x1, y1, x2, y2 = self.data_processor.get_crop_coords(img_arr)
+            coords = (x1, y1, x2, y2)
+            
+            crop_img = img_arr[y1:y2, x1:x2]
+            s_pil = Image.fromarray(crop_img).resize((self.opt.input_size, self.opt.input_size))
+            
+            # Prepare full image tensor on GPU for paste-back
+            full_img_tensor = transforms.ToTensor()(img_pil).to(self.device).unsqueeze(0)
+
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = (
             self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
@@ -589,6 +630,10 @@ class InferenceAgent:
             m_c = self.renderer.latent_token_decoder(ta_c)
             out_frame = self.renderer.decode(m_c, m_r, f_r)
 
+            if full_img_tensor is not None:
+                # GPU Paste Back
+                out_frame = self.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
+
             # Convert frame to numpy for HLS generator
             frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
             if frame_np.min() < 0:
@@ -620,11 +665,24 @@ class InferenceAgent:
         elif self.device == "cuda":
             torch.cuda.empty_cache()
 
-        s_pil = (
-            self.data_processor.process_img(source_img_pil)
-            if crop
-            else source_img_pil.resize((self.opt.input_size, self.opt.input_size))
-        )
+        if crop:
+            s_pil = self.data_processor.process_img(source_img_pil)
+            full_img_tensor = None
+            coords = None
+        else:
+            # Crop-Infer-Paste Logic
+            img_arr = np.array(source_img_pil)
+            if img_arr.ndim == 2: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+            elif img_arr.shape[2] == 4: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+            
+            x1, y1, x2, y2 = self.data_processor.get_crop_coords(img_arr)
+            coords = (x1, y1, x2, y2)
+            
+            crop_img = img_arr[y1:y2, x1:x2]
+            s_pil = Image.fromarray(crop_img).resize((self.opt.input_size, self.opt.input_size))
+            
+            # Prepare full image tensor on GPU for paste-back
+            full_img_tensor = transforms.ToTensor()(source_img_pil).to(self.device).unsqueeze(0)
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         f_r, i_r = self.renderer.app_encode(s_tensor)
         t_r = self.renderer.mot_encode(s_tensor)
@@ -656,6 +714,11 @@ class InferenceAgent:
             ta_c = self.renderer.adapt(t_c, i_r)
             ma_c = self.renderer.mot_decode(ta_c)
             out = self.renderer.decode(ma_c, ma_r, f_r)
+            
+            if full_img_tensor is not None:
+                # GPU Paste Back
+                out = self.data_processor.paste_back_tensor(out, full_img_tensor, coords)
+            
             vid_results.append(out.cpu())
 
             # Clear cache periodically
@@ -714,11 +777,25 @@ class InferenceAgent:
 
         try:
             # Image preprocessing (only once per session, done by caller)
-            s_pil = (
-                self.data_processor.process_img(img_pil)
-                if crop
-                else img_pil.resize((self.opt.input_size, self.opt.input_size))
-            )
+            if crop:
+                s_pil = self.data_processor.process_img(img_pil)
+                full_img_tensor = None
+                coords = None
+            else:
+                # Crop-Infer-Paste Logic
+                img_arr = np.array(img_pil)
+                if img_arr.ndim == 2: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+                elif img_arr.shape[2] == 4: img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+                
+                x1, y1, x2, y2 = self.data_processor.get_crop_coords(img_arr)
+                coords = (x1, y1, x2, y2)
+                
+                crop_img = img_arr[y1:y2, x1:x2]
+                s_pil = Image.fromarray(crop_img).resize((self.opt.input_size, self.opt.input_size))
+                
+                # Prepare full image tensor on GPU for paste-back
+                full_img_tensor = transforms.ToTensor()(img_pil).to(self.device).unsqueeze(0)
+
             s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
             
             # Convert numpy chunk to torch tensor (16kHz audio)
@@ -783,6 +860,10 @@ class InferenceAgent:
                 ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
                 m_c = self.renderer.latent_token_decoder(ta_c)
                 out_frame = self.renderer.decode(m_c, m_r, f_r)
+
+                if full_img_tensor is not None:
+                    # GPU Paste Back
+                    out_frame = self.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
 
                 # Convert to numpy
                 frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
