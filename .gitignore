@@ -79,3 +79,8 @@ renderer/__pycache__/*
 
 hls_output/
 idle_loops/
+test_assets/
+trt_engines/
+onnx_models/
+benchmark_results_audio/
+benchmark_results_trt/
