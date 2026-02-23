@@ -1133,6 +1133,87 @@ class DataProcessor:
         crop_pil = Image.fromarray(crop_img)
         return crop_pil.resize((512, 512))
 
+    def get_crop_coords(self, img_arr: np.ndarray) -> tuple:
+        """Return (x1, y1, x2, y2) crop coords from a numpy RGB image."""
+        h, w = img_arr.shape[:2]
+        
+        if self.fa is None:
+            cx, cy = w // 2, h // 2
+            half = min(w, h) // 2
+            return (cx - half, cy - half, cx + half, cy + half)
+            
+        try:
+            bboxes = self.fa.face_detector.detect_from_image(img_arr)
+            if bboxes is None or len(bboxes) == 0:
+                bboxes = self.fa.face_detector.detect_from_image(img_arr)
+        except Exception as e:
+            print(f"Face detection failed in get_crop_coords: {e}")
+            bboxes = None
+            
+        valid_bboxes = []
+        if bboxes is not None:
+            valid_bboxes = [
+                (int(x1), int(y1), int(x2), int(y2), score)
+                for (x1, y1, x2, y2, score) in bboxes
+                if score > 0.5
+            ]
+            
+        if not valid_bboxes:
+            cx, cy = w // 2, h // 2
+            half = min(w, h) // 2
+            x1_new, x2_new = cx - half, cx + half
+            y1_new, y2_new = cy - half, cy + half
+        else:
+            x1, y1, x2, y2, _ = valid_bboxes[0]
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            w_face = x2 - x1
+            h_face = y2 - y1
+            half_side = int(max(w_face, h_face) * self.crop_scale)
+            x1_new = cx - half_side
+            y1_new = cy - half_side
+            x2_new = cx + half_side
+            y2_new = cy + half_side
+            
+            # Boundary checks
+            x1_new = max(0, x1_new)
+            y1_new = max(0, y1_new)
+            x2_new = min(w, x2_new)
+            y2_new = min(h, y2_new)
+            
+            curr_w = x2_new - x1_new
+            curr_h = y2_new - y1_new
+            min_side = min(curr_w, curr_h)
+            x2_new = x1_new + min_side
+            y2_new = y1_new + min_side
+            
+        return (int(x1_new), int(y1_new), int(x2_new), int(y2_new))
+
+    def paste_back_tensor(self, face_tensor, full_img_tensor, coords):
+        """Paste face_tensor [1,3,H,W] back into full_img_tensor [1,3,H,W] at coords."""
+        import torch.nn.functional as F
+        x1, y1, x2, y2 = coords
+        _, _, fh, fw = full_img_tensor.shape
+        
+        # Normalize face to [0,1] if needed
+        face = face_tensor.clone()
+        if face.min() < 0:
+            face = (face + 1) / 2
+        face = face.clamp(0, 1)
+        
+        # Resize face to target region size
+        region_h, region_w = y2 - y1, x2 - x1
+        face_resized = F.interpolate(face, size=(region_h, region_w), mode='bilinear', align_corners=False)
+        
+        # Paste into full image copy
+        result = full_img_tensor.clone()
+        if result.min() < 0:
+            result = (result + 1) / 2
+        result = result.clamp(0, 1)
+        result[:, :, y1:y2, x1:x2] = face_resized
+        return result
+
+
     def process_audio(self, path: str) -> torch.Tensor:
         if librosa is None:
             raise ImportError("librosa is required for process_audio")
@@ -1478,7 +1559,7 @@ class ParallelRenderer:
             all_frames.extend(rendered_chunks[cid])
         return all_frames
 
-    def render_progressive_hls(self, sample, g_r, m_r, f_r, hls_generator):
+    def render_progressive_hls(self, sample, g_r, m_r, f_r, hls_generator, full_img_tensor=None, coords=None):
         T = sample.shape[1]
         chunks = [(i // self.chunk_size, i, min(i + self.chunk_size, T)) for i in range(0, T, self.chunk_size)]
         rendered_chunks = {}
@@ -1496,6 +1577,11 @@ class ParallelRenderer:
                 rendered_chunks[cid] = frames
                 while next_to_send in rendered_chunks:
                     for f in rendered_chunks[next_to_send]:
+                        if full_img_tensor is not None and coords is not None:
+                            f_t = torch.from_numpy(f).permute(2,0,1).unsqueeze(0).float() / 255.0
+                            f_t = f_t.to(full_img_tensor.device)
+                            pasted = self.agent.data_processor.paste_back_tensor(f_t, full_img_tensor, coords)
+                            f = (np.clip(pasted.squeeze(0).permute(1,2,0).cpu().numpy(), 0, 1) * 255).astype(np.uint8)
                         hls_generator.add_frame(f)
                     del rendered_chunks[next_to_send]
                     next_to_send += 1
@@ -1571,6 +1657,42 @@ class InferenceAgent:
             for name, param in model.named_parameters():
                 if name in clean: param.copy_(clean[name].to(self.device))
 
+    def prepare_source_image(self, img_pil: Image.Image, crop: bool):
+        """
+        Prepare source image for inference.
+
+        If crop=True:  face-detect and crop (existing behaviour via process_img).
+        If crop=False: Crop-Infer-Paste mode -- detect face crop coords, crop the face
+                       region, resize it for the model, AND return the full-image tensor
+                       + coords needed for paste-back.
+
+        Returns:
+            s_pil    (PIL Image at input_size): ready for self.data_processor.transform()
+            full_img_tensor (Tensor [1,3,H,W] on self.device, or None if crop=True)
+            coords   (x1,y1,x2,y2 tuple, or None if crop=True)
+        """
+        if crop:
+            s_pil = self.data_processor.process_img(img_pil)
+            return s_pil, None, None
+
+        import torchvision.transforms as transforms
+        # Crop-Infer-Paste Logic
+        img_arr = np.array(img_pil)
+        if img_arr.ndim == 2:
+            img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+        elif img_arr.shape[2] == 4:
+            img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+
+        x1, y1, x2, y2 = self.data_processor.get_crop_coords(img_arr)
+        coords = (x1, y1, x2, y2)
+
+        crop_img = img_arr[y1:y2, x1:x2]
+        s_pil = Image.fromarray(crop_img).resize(
+            (self.opt.input_size, self.opt.input_size)
+        )
+        full_img_tensor = transforms.ToTensor()(img_pil).to(self.device).unsqueeze(0)
+        return s_pil, full_img_tensor, coords
+
     def save_video(self, vid_tensor, fps, audio_path=None):
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             raw_path = tmp.name
@@ -1601,7 +1723,7 @@ class InferenceAgent:
     @torch.no_grad()
     def run_audio_inference(self, img_pil, aud_path, crop, seed, nfe, cfg_scale, pose_style=None, gaze_style=None, is_streaming=False):
         torch.cuda.empty_cache()
-        s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((512, 512))
+        s_pil, full_img_tensor, coords = self.prepare_source_image(img_pil, crop)
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
         
@@ -1630,13 +1752,21 @@ class InferenceAgent:
         m_r = self.renderer.latent_token_decoder(ta_r)
         
         if is_streaming:
-            frames = self.parallel_renderer.render_parallel(sample, g_r, m_r, f_r)
+            raw_frames = self.parallel_renderer.render_parallel(sample, g_r, m_r, f_r)
+            frames = []
+            for f in raw_frames:
+                if full_img_tensor is not None:
+                    f = self.data_processor.paste_back_tensor(f.to(self.device), full_img_tensor, coords).cpu()
+                frames.append(f)
         else:
             frames = []
             for t in range(sample.shape[1]):
                 ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
                 m_c = self.renderer.latent_token_decoder(ta_c)
-                frames.append(self.renderer.decode(m_c, m_r, f_r).cpu())
+                out = self.renderer.decode(m_c, m_r, f_r)
+                if full_img_tensor is not None:
+                    out = self.data_processor.paste_back_tensor(out, full_img_tensor, coords)
+                frames.append(out.cpu())
                 if t % 10 == 0: torch.cuda.empty_cache()
         
         vid_tensor = torch.stack(frames, dim=1).squeeze(0)
@@ -1644,7 +1774,7 @@ class InferenceAgent:
 
     @torch.no_grad()
     def run_audio_inference_streaming(self, img_pil, aud_path, crop, seed, nfe, cfg_scale):
-        s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((512, 512))
+        s_pil, full_img_tensor, coords = self.prepare_source_image(img_pil, crop)
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
         
@@ -1663,12 +1793,15 @@ class InferenceAgent:
         for t in range(sample.shape[1]):
             ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
             m_c = self.renderer.latent_token_decoder(ta_c)
-            yield self.renderer.decode(m_c, m_r, f_r).squeeze(0)
+            out = self.renderer.decode(m_c, m_r, f_r)
+            if full_img_tensor is not None:
+                out = self.data_processor.paste_back_tensor(out, full_img_tensor, coords)
+            yield out.squeeze(0)
 
     @torch.no_grad()
     def run_audio_inference_progressive(self, img_pil, aud_path, crop, seed, nfe, cfg_scale, hls_generator, pose_style=None, gaze_style=None, is_final_chunk=False):
         torch.cuda.empty_cache()
-        s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((512, 512))
+        s_pil, full_img_tensor, coords = self.prepare_source_image(img_pil, crop)
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = self.data_processor.process_audio(aud_path).unsqueeze(0).to(self.device)
         
@@ -1692,7 +1825,7 @@ class InferenceAgent:
         ta_r = self.renderer.adapt(t_lat, g_r)
         m_r = self.renderer.latent_token_decoder(ta_r)
         
-        self.parallel_renderer.render_progressive_hls(sample, g_r, m_r, f_r, hls_generator)
+        self.parallel_renderer.render_progressive_hls(sample, g_r, m_r, f_r, hls_generator, full_img_tensor, coords)
         hls_generator.finalize(audio_path=aud_path, mark_complete=is_final_chunk)
 
     @torch.no_grad()
@@ -1734,7 +1867,7 @@ class InferenceAgent:
     @torch.no_grad()
     def run_audio_inference_chunked(self, img_pil, audio_chunk_np, crop, seed, nfe, cfg_scale, hls_generator, pose_style=None, gaze_style=None):
         torch.cuda.empty_cache()
-        s_pil = self.data_processor.process_img(img_pil) if crop else img_pil.resize((512, 512))
+        s_pil, full_img_tensor, coords = self.prepare_source_image(img_pil, crop)
         s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
         a_tensor = torch.from_numpy(audio_chunk_np).float().unsqueeze(0).to(self.device)
         
@@ -1763,6 +1896,8 @@ class InferenceAgent:
             ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
             m_c = self.renderer.latent_token_decoder(ta_c)
             out = self.renderer.decode(m_c, m_r, f_r)
+            if full_img_tensor is not None:
+                out = self.data_processor.paste_back_tensor(out, full_img_tensor, coords)
             f_np = (np.clip(out.squeeze(0).permute(1, 2, 0).detach().cpu().numpy(), 0, 1) * 255).astype(np.uint8)
             hls_generator.add_frame(f_np)
             frames += 1
@@ -1815,11 +1950,8 @@ class InferenceAgent:
         
         try:
             # 1. Preprocessing
-            if crop:
-                img = self.data_processor.process_img(img_pil)
-            else:
-                img = img_pil.resize((self.opt.input_size, self.opt.input_size))
-            s_tensor = self.data_processor.transform(img).unsqueeze(0).to(self.device)
+            s_pil, full_img_tensor, coords = self.prepare_source_image(img_pil, crop)
+            s_tensor = self.data_processor.transform(s_pil).unsqueeze(0).to(self.device)
             
             # 2. Source Encoding (TensorRT)
             enc_outputs = trt_handler.source_encoder.infer([s_tensor])
@@ -1851,7 +1983,12 @@ class InferenceAgent:
                     trt_inputs[f"ma_r_{idx}"] = ma_r[idx]
                 
                 out_dict = trt_handler.audio_renderer.infer(trt_inputs)
-                yield out_dict["output_image"].unsqueeze(0).cpu()
+                out_frame = out_dict["output_image"]
+                
+                if full_img_tensor is not None:
+                    out_frame = self.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
+                    
+                yield out_frame.unsqueeze(0).cpu()
                 
                 if t % 20 == 0:
                     torch.cuda.empty_cache()
