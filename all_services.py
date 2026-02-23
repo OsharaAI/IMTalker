@@ -11,6 +11,7 @@ import cv2
 import tempfile
 import time
 import random
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 import fractions
 import collections
@@ -117,6 +118,9 @@ except ImportError as e:
 MAX_CONCURRENT_WEBRTC_SESSIONS = (
     3  # Max simultaneous WebRTC sessions (increase if GPU can handle it)
 )
+
+# Oshara API base URL for session auth & close
+OSHARA_API_BASE = "https://api.oshara.ai/api"
 
 # Load avatar configuration (avatar→voice mapping)
 AVATAR_CONFIG = {}
@@ -2923,6 +2927,7 @@ class ConversationManager:
         reference_audio=None,
         sync_manager=None,
         enable_realtime=True,
+        webrtc_session_id=None,
     ):
         self.openai_client = openai_client
         self.tts_model = tts_model
@@ -2931,6 +2936,7 @@ class ConversationManager:
         self.audio_track = audio_track
         self.avatar_img = avatar_img
         self.sync_manager = sync_manager
+        self.webrtc_session_id = webrtc_session_id  # For Oshara log lookup
 
         # Frame interpolation settings
         self.enable_frame_blending = True  # Smooth transitions between chunks
@@ -2970,6 +2976,16 @@ class ConversationManager:
         self._BARGE_IN_ENERGY_THRESHOLD = 0.015  # RMS energy for real speech
         self._BARGE_IN_CONFIRM_WINDOW = 0.35  # seconds of sustained speech needed
         self._BARGE_IN_MIN_FRAMES = 5  # minimum frames above threshold
+
+        # ── Pipeline timing tracking (for Oshara logs) ──
+        self._last_user_msg_time = None
+        self._current_pipeline_start = None
+        self._current_llm_latency = None
+        self._pipeline_tts_time = None
+        self._pipeline_render_time = None
+        self._pipeline_stream_time = None
+        self._pipeline_total_time = None
+        self._pipeline_total_frames = None
 
         # ── OpenAI Realtime API Session ──
         # Replaces: local VAD + Whisper STT + ChatCompletions LLM
@@ -3058,6 +3074,23 @@ class ConversationManager:
 
         # Mirror to local history for logging
         self.conversation_history.append({"role": "assistant", "content": full_text})
+
+        # Measure LLM response latency (time from user message to AI response)
+        llm_latency = None
+        if hasattr(self, '_last_user_msg_time') and self._last_user_msg_time:
+            llm_latency = round(time.time() - self._last_user_msg_time, 3)
+        self._current_pipeline_start = time.time()
+        self._current_llm_latency = llm_latency
+
+        # ── Record to Oshara conversation logs (timings will be updated at pipeline end) ──
+        _record_oshara_log(
+            app,
+            response=full_text,
+            additional_data={
+                "llm_response_time_s": llm_latency,
+            },
+            session_id=self.webrtc_session_id,
+        )
         if len(self.conversation_history) > self.max_history_turns * 2:
             self.conversation_history = self.conversation_history[
                 -(self.max_history_turns * 2) :
@@ -3207,6 +3240,15 @@ class ConversationManager:
         print(f"CM: User transcript: '{text}'")
         # Mirror to local history for logging
         self.conversation_history.append({"role": "user", "content": text})
+
+        # ── Record to Oshara conversation logs ──
+        # Track when user message arrived so we can measure LLM response latency
+        self._last_user_msg_time = time.time()
+        _record_oshara_log(
+            app,
+            message=text,
+            session_id=self.webrtc_session_id,
+        )
         if len(self.conversation_history) > self.max_history_turns * 2:
             self.conversation_history = self.conversation_history[
                 -(self.max_history_turns * 2) :
@@ -3246,6 +3288,24 @@ class ConversationManager:
         """
         print(f"CM: Processing response text: '{response_text[:80]}...'")
         pipeline_start = time.time()
+
+        # Shared timing dict — populated by each pipeline stage
+        pipeline_timings = {
+            "pipeline_start_utc": datetime.now(timezone.utc).isoformat(),
+            "llm_response_time_s": getattr(self, '_current_llm_latency', None),
+            "response_text": response_text,
+            "tts_total_time_s": None,
+            "tts_per_sentence": [],    # [{sentence, tts_time_s, audio_duration_s}]
+            "render_total_time_s": None,
+            "render_per_sentence": [],  # [{sentence, render_time_s, frame_count}]
+            "total_audio_duration_s": 0.0,
+            "first_byte_latency_s": None,
+            "streaming_time_s": None,
+            "total_pipeline_time_s": None,
+            "total_frames": 0,
+            "status": "started",
+        }
+
         try:
             self.is_speaking = True
 
@@ -3330,11 +3390,18 @@ class ConversationManager:
                         print(
                             f"⏱️  TTS sentence {chunk_idx}: {tts_time:.3f}s → {duration:.1f}s audio: '{sentence[:40]}...'"
                         )
+                        pipeline_timings["tts_per_sentence"].append({
+                            "sentence": sentence,
+                            "tts_time_s": round(tts_time, 3),
+                            "audio_duration_s": round(duration, 3),
+                        })
+                        pipeline_timings["total_audio_duration_s"] += duration
                         await audio_queue.put((audio_24k_np, sentence, chunk_idx))
                     else:
                         print(f"⏱️  TTS sentence {chunk_idx}: empty audio, skipping")
 
                 print(f"⏱️  TTS total: {tts_total_time:.3f}s")
+                pipeline_timings["tts_total_time_s"] = round(tts_total_time, 3)
 
             # ── Stage 3: Renderer ──
             # Takes audio from audio_queue, renders video, pushes A/V pairs to av_queue.
@@ -3478,11 +3545,17 @@ class ConversationManager:
                     render_total_time += render_time
                     del audio_24k_np
 
+                    pipeline_timings["render_per_sentence"].append({
+                        "sentence": sentence,
+                        "render_time_s": round(render_time, 3),
+                        "frame_count": frame_count,
+                    })
                     print(
                         f"⏱️  Render sentence {chunk_idx}: {render_time:.3f}s → {frame_count} A/V pairs"
                     )
 
                 print(f"⏱️  Render total: {render_total_time:.3f}s")
+                pipeline_timings["render_total_time_s"] = round(render_total_time, 3)
 
             # ── Stage 4: A/V Streamer ──
             PRE_BUFFER_FRAMES = 3
@@ -3529,6 +3602,7 @@ class ConversationManager:
                             started = True
                             pre_buffer = None
                             latency = clock - pipeline_start
+                            pipeline_timings["first_byte_latency_s"] = round(latency, 3)
                             print(
                                 f"⏱️  FIRST A/V PAIR: {latency:.3f}s from pipeline start ({PRE_BUFFER_FRAMES} pre-buffered)"
                             )
@@ -3563,20 +3637,36 @@ class ConversationManager:
                 print(
                     f"⏱️  Streamed {total_frames} A/V pairs in {elapsed:.2f}s ({fps_actual:.1f} FPS)"
                 )
-                print(f"⏱️  TOTAL PIPELINE: {time.time() - pipeline_start:.3f}s")
+                total_pipeline_time = time.time() - pipeline_start
+                print(f"⏱️  TOTAL PIPELINE: {total_pipeline_time:.3f}s")
+                pipeline_timings["streaming_time_s"] = round(elapsed, 3)
+                pipeline_timings["total_pipeline_time_s"] = round(total_pipeline_time, 3)
+                pipeline_timings["total_frames"] = total_frames
 
             # Run ALL stages concurrently
             await asyncio.gather(
                 sentence_feeder(), tts_worker(), renderer(), av_streamer()
             )
 
+            pipeline_timings["status"] = "completed"
+
         except asyncio.CancelledError:
             print("CM: Pipeline cancelled (barge-in)")
+            pipeline_timings["status"] = "cancelled"
+            pipeline_timings["total_pipeline_time_s"] = round(time.time() - pipeline_start, 3)
         except Exception as e:
             print(f"CM Pipeline Error: {e}")
             traceback.print_exc()
+            pipeline_timings["status"] = "error"
+            pipeline_timings["error"] = str(e)
+            pipeline_timings["total_pipeline_time_s"] = round(time.time() - pipeline_start, 3)
         finally:
             self.is_speaking = False
+            # Round the audio duration
+            pipeline_timings["total_audio_duration_s"] = round(pipeline_timings.get("total_audio_duration_s", 0), 3)
+            # ── Update last Oshara log entry with ALL step timings ──
+            logger.info(f"Pipeline timings for Oshara log: {json.dumps(pipeline_timings, default=str)[:800]}")
+            _update_last_oshara_log_timings(app, pipeline_timings, session_id=self.webrtc_session_id)
 
     async def generate_and_feed(self, text):
         """Real-time streaming pipeline with LOCKED audio-video synchronization.
@@ -3593,12 +3683,30 @@ class ConversationManager:
         """
         print(f"CM: Generating response: {text[:50]}{'...' if len(text) > 50 else ''}")
         self.is_speaking = True
+        pipeline_start = time.time()
 
         t_parse = time.time()
         text_chunks = parse_chunk_labels(text)
         print(
             f"⏱️  Chunk parsing: {time.time() - t_parse:.3f}s → {len(text_chunks)} chunks"
         )
+
+        # Shared timing dict — populated by each pipeline stage
+        pipeline_timings = {
+            "pipeline_start_utc": datetime.now(timezone.utc).isoformat(),
+            "llm_response_time_s": getattr(self, '_current_llm_latency', None),
+            "response_text": text,
+            "tts_total_time_s": None,
+            "tts_per_chunk": [],       # [{chunk_text, tts_time_s, audio_duration_s}]
+            "render_total_time_s": None,
+            "render_per_chunk": [],     # [{chunk_text, render_time_s, frame_count}]
+            "total_audio_duration_s": 0.0,
+            "first_byte_latency_s": None,
+            "streaming_time_s": None,
+            "total_pipeline_time_s": None,
+            "total_frames": 0,
+            "status": "started",
+        }
 
         # TTS output queue
         audio_chunks_queue = asyncio.Queue(maxsize=2)
@@ -3641,6 +3749,12 @@ class ConversationManager:
                         print(
                             f"⏱️  TTS chunk {chunk_idx}/{len(text_chunks)}: {tts_chunk_time:.3f}s → {duration:.1f}s audio"
                         )
+                        pipeline_timings["tts_per_chunk"].append({
+                            "chunk_text": text_chunk,
+                            "tts_time_s": round(tts_chunk_time, 3),
+                            "audio_duration_s": round(duration, 3),
+                        })
+                        pipeline_timings["total_audio_duration_s"] += duration
                     else:
                         del audio_parts
 
@@ -3648,6 +3762,7 @@ class ConversationManager:
                 print(
                     f"⏱️  TTS total: {tts_total_time:.3f}s for {len(text_chunks)} chunks"
                 )
+                pipeline_timings["tts_total_time_s"] = round(tts_total_time, 3)
 
             # Stage 2: Render → stream paired (frame, audio_slice) into av_queue
             # Includes inter-chunk frame blending for smooth transitions between text chunks
@@ -3815,8 +3930,14 @@ class ConversationManager:
                     print(
                         f"⏱️  Render chunk {chunk_idx}: {render_time:.3f}s → {frame_count} A/V pairs (streamed)"
                     )
+                    pipeline_timings["render_per_chunk"].append({
+                        "chunk_text": text_chunk,
+                        "render_time_s": round(render_time, 3),
+                        "frame_count": frame_count,
+                    })
 
                 print(f"⏱️  Render total: {render_total_time:.3f}s")
+                pipeline_timings["render_total_time_s"] = round(render_total_time, 3)
 
             # Stage 3: A/V streaming with pre-buffering and shared clock
             PRE_BUFFER_FRAMES_FEED = 3
@@ -3906,16 +4027,28 @@ class ConversationManager:
                 print(
                     f"CM: Streamed {total_frames} A/V pairs in {elapsed:.2f}s ({fps_actual:.1f} FPS)"
                 )
+                pipeline_timings["streaming_time_s"] = round(elapsed, 3)
+                pipeline_timings["total_frames"] = total_frames
 
             # Run all stages concurrently
             await asyncio.gather(audio_chunker(), renderer(), av_streamer())
 
+            pipeline_timings["status"] = "completed"
+            pipeline_timings["total_pipeline_time_s"] = round(time.time() - pipeline_start, 3)
+
         except Exception as e:
             print(f"CM: Pipeline error: {e}")
             traceback.print_exc()
+            pipeline_timings["status"] = "error"
+            pipeline_timings["error"] = str(e)
+            pipeline_timings["total_pipeline_time_s"] = round(time.time() - pipeline_start, 3)
         finally:
             print("CM: Resetting is_speaking to False")
             self.is_speaking = False
+            pipeline_timings["total_audio_duration_s"] = round(pipeline_timings.get("total_audio_duration_s", 0), 3)
+            # ── Update last Oshara log entry with ALL step timings ──
+            logger.info(f"Pipeline timings for Oshara log: {json.dumps(pipeline_timings, default=str)[:800]}")
+            _update_last_oshara_log_timings(app, pipeline_timings, session_id=self.webrtc_session_id)
 
     async def pre_render_to_buffer(self, text):
         """Pre-render text to a list of (VideoFrame, audio_int16) pairs WITHOUT pushing to tracks.
@@ -5059,11 +5192,146 @@ async def generate_video_stream_get(text: str, avatar: str = "assets/source_1.pn
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================================
+# OSHARA SESSION HELPERS
+# ============================================================================
+
+
+def _record_oshara_log(
+    app_instance,
+    message: str = "",
+    response: str = "",
+    additional_data: dict = None,
+    session_id: str = None,
+):
+    """Append a conversation log entry to a WebRTC session's Oshara log list.
+
+    Args:
+        app_instance: The FastAPI app instance
+        message: User message text
+        response: AI response text
+        additional_data: Extra data dict (timings, etc.)
+        session_id: Explicit WebRTC session ID (preferred). Falls back to active_webrtc_session.
+    """
+    sid = session_id or getattr(app_instance.state, "active_webrtc_session", None)
+    if not sid:
+        logger.warning("Oshara log: no session_id available, skipping")
+        return
+    meta = app_instance.state.active_session_meta.get(sid)
+    if not meta:
+        logger.warning(f"Oshara log: session {sid} not found in active_session_meta, skipping")
+        return
+    if not meta.get("oshara_session_id"):
+        logger.warning(f"Oshara log: session {sid} has no oshara_session_id, skipping")
+        return
+
+    log_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "message": message,
+        "response": response,
+        "additional_data": additional_data or {},
+    }
+    meta.setdefault("conversation_logs", []).append(log_entry)
+    total_logs = len(meta["conversation_logs"])
+    logger.info(f"Oshara log recorded for session {sid} (total={total_logs}): msg='{message[:40] if message else ''}', resp='{response[:40] if response else ''}'")
+    logger.info(f"Oshara log entry: {json.dumps(log_entry, default=str)[:300]}")
+
+
+def _update_last_oshara_log_timings(app_instance, timings: dict, session_id: str = None):
+    """Update the most recent Oshara log entry's additional_data with step timings.
+
+    Called at the end of a pipeline to attach TTS/render/streaming durations
+    to the response log entry that was created when the AI response arrived.
+
+    Args:
+        app_instance: The FastAPI app instance
+        timings: Dict of timing values to merge into additional_data
+        session_id: Explicit WebRTC session ID (preferred). Falls back to active_webrtc_session.
+    """
+    sid = session_id or getattr(app_instance.state, "active_webrtc_session", None)
+    if not sid:
+        return
+    meta = app_instance.state.active_session_meta.get(sid)
+    if not meta or not meta.get("oshara_session_id"):
+        return
+
+    logs = meta.get("conversation_logs", [])
+    if not logs:
+        return
+
+    # Find the last log entry that has a response (AI response log)
+    found = False
+    for entry in reversed(logs):
+        if entry.get("response"):
+            entry.setdefault("additional_data", {}).update(timings)
+            found = True
+            logger.info(f"Oshara log timings updated for session {sid} — keys: {list(timings.keys())}")
+            logger.info(f"Oshara updated log entry additional_data: {json.dumps(entry.get('additional_data', {}), default=str)[:600]}")
+            break
+    if not found:
+        logger.warning(f"Oshara log timings: no response entry found in {len(logs)} log(s) for session {sid} — timings NOT saved")
+
+
+async def _close_oshara_session(meta: dict):
+    """Send conversation logs to Oshara close API and mark session as closed."""
+    oshara_sid = meta.get("oshara_session_id")
+    bearer_token = meta.get("oshara_bearer_token")
+    if not oshara_sid or not bearer_token:
+        return
+
+    raw_logs = meta.get("conversation_logs", [])
+    logger.info(f"Closing Oshara session {oshara_sid} with {len(raw_logs)} log entries")
+    if raw_logs:
+        for i, entry in enumerate(raw_logs):
+            logger.info(f"  Log[{i}]: msg='{(entry.get('message','') or '')[:60]}', resp='{(entry.get('response','') or '')[:60]}', data={entry.get('additional_data',{})}")
+    else:
+        logger.warning(f"Oshara session {oshara_sid}: NO conversation logs collected!")
+
+    # Sanitize logs: round-trip through JSON to convert any non-serializable types
+    # (numpy floats/ints, datetime objects, etc.) to plain JSON-safe values.
+    try:
+        logs = json.loads(json.dumps(raw_logs, default=str))
+    except Exception as ser_err:
+        logger.error(f"Oshara log serialization error: {ser_err}; sending raw logs")
+        logs = raw_logs
+
+    payload = {"logs": logs}
+    logger.info(f"Oshara close request URL: {OSHARA_API_BASE}/ai-conversation-session/{oshara_sid}/close/")
+    logger.info(f"Oshara close request payload: {json.dumps(payload, default=str)[:1000]}")
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{OSHARA_API_BASE}/ai-conversation-session/{oshara_sid}/close/",
+                json=payload,
+                headers={"Authorization": f"Bearer {bearer_token}"},
+            )
+            logger.info(f"Oshara close response status: {resp.status_code}")
+            logger.info(f"Oshara close response body: {resp.text[:500]}")
+            if resp.status_code >= 400:
+                logger.error(
+                    f"Oshara close API error {resp.status_code}: {resp.text}"
+                )
+            resp.raise_for_status()
+            result = resp.json()
+            logger.info(f"Oshara session {oshara_sid} closed successfully: {result}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Failed to close Oshara session {oshara_sid}: HTTP {e.response.status_code} — {e.response.text}")
+    except Exception as e:
+        logger.error(f"Failed to close Oshara session {oshara_sid}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+
 async def _cleanup_webrtc_session(session_id: str, reason: str = "unknown"):
     """Full cleanup of a WebRTC session: close PC, cleanup ConvManager, free GPU, clear state."""
     logger.info(f"🧹 Cleaning up session {session_id} (reason: {reason})")
 
     meta = app.state.active_session_meta.get(session_id)
+
+    # 0. Close Oshara session and send conversation logs
+    if meta:
+        await _close_oshara_session(meta)
 
     # 1. Cleanup ConversationManager (executors, buffers, Realtime session)
     if meta and meta.get("conv_manager"):
@@ -5141,6 +5409,51 @@ async def webrtc_offer(request: Request):
 
         if not sdp:
             raise HTTPException(status_code=400, detail="SDP is required")
+
+        # ─── Oshara session auth ───
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.lower().startswith("bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail="Missing or invalid Authorization header. Bearer token required.",
+            )
+        bearer_token = auth_header.split(" ", 1)[1]
+
+        oshara_session_id = None
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                oshara_resp = await client.post(
+                    f"{OSHARA_API_BASE}/ai-conversation-session/auth/",
+                    json={"metadata": {}},
+                    headers={"Authorization": f"Bearer {bearer_token}"},
+                )
+                oshara_resp.raise_for_status()
+                oshara_data = oshara_resp.json()
+                logger.info(f"Oshara auth response: {oshara_data}")
+
+                # Response is nested: {"success": ..., "data": {"allow_to_connect": ..., "session_id": ...}}
+                oshara_payload = oshara_data.get("data", oshara_data)
+
+                if not oshara_payload.get("allow_to_connect"):
+                    raise HTTPException(
+                        status_code=403,
+                        detail=oshara_payload.get("message", "Connection not allowed by Oshara API."),
+                    )
+                oshara_session_id = oshara_payload.get("session_id")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Oshara auth HTTP error: {e.response.status_code} {e.response.text}")
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=f"Oshara auth failed: {e.response.text}",
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Oshara auth error: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not reach Oshara auth API: {e}",
+            )
 
         # ─── Session limit guard: enforce MAX_CONCURRENT_WEBRTC_SESSIONS ───
         async with app.state._session_lock:
@@ -5351,6 +5664,10 @@ async def webrtc_offer(request: Request):
             "audio_track": audio_track,
             "conv_manager": None,
             "created_at": time.time(),
+            # Oshara session tracking
+            "oshara_session_id": oshara_session_id,
+            "oshara_bearer_token": bearer_token,
+            "conversation_logs": [],  # [{timestamp, message, response, additional_data}]
         }
 
         # Kick off idle animation render in background if not cached yet
@@ -5392,6 +5709,7 @@ async def webrtc_offer(request: Request):
                 system_prompt=system_prompt,
                 reference_audio=reference_audio,
                 sync_manager=sync_manager,
+                webrtc_session_id=session_id,
             )
             # Connect to OpenAI Realtime API (WebSocket for VAD + STT + LLM)
             await conv_manager.connect_realtime()
@@ -5479,6 +5797,7 @@ async def webrtc_offer(request: Request):
                     reference_audio=reference_audio,
                     sync_manager=sync_manager,
                     enable_realtime=False,
+                    webrtc_session_id=session_id,
                 )
             try:
                 pre_rendered_pairs = await target_cm.pre_render_to_buffer(greet_text)
@@ -5511,6 +5830,7 @@ async def webrtc_offer(request: Request):
             "sdp": pc.localDescription.sdp,
             "type": pc.localDescription.type,
             "session_id": session_id,
+            "oshara_session_id": oshara_session_id,
             "status": "connecting",
             "greeting": greeting if greeting else text,
             "conv_mode": conv_mode,
