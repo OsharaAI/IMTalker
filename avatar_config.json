@@ -4,13 +4,15 @@
             "name": "Modern Corporate",
             "voice": "Olivia.wav",
             "voice_type": "predefined",
-            "greeting": "Hi there! How are you doing today?"
+            "greeting": "Hi there! How are you doing today?",
+            "preload": true
         },
         "assets/source_2.png": {
             "name": "Casual Creative",
             "voice": "Emily.wav",
             "voice_type": "predefined",
-            "greeting": "Hey! What's on your mind?"
+            "greeting": "Hey! What's on your mind?",
+            "preload": true
         },
         "assets/source_3.jpg": {
             "name": "Avatar 3",
