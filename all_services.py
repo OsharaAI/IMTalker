@@ -6744,6 +6744,7 @@ async def audio_driven_stream_hls(
     nfe: int = Form(10),
     cfg_scale: float = Form(3.0),
     session_id: Optional[str] = Form(None),
+    voice_gender: str = Form("male", description="Voice gender: 'male' or 'female' (for Nepali TTS)"),
 ):
     """Start or resume a progressive HLS streaming session"""
     if session_id is None:
@@ -6928,6 +6929,7 @@ async def chunked_stream_init(
     chunk_duration: float = Form(2.0),
     pose_style: Optional[str] = Form(None),
     gaze_style: Optional[str] = Form(None),
+    voice_gender: str = Form("male", description="Voice gender: 'male' or 'female' (for Nepali TTS)"),
 ):
     sid = session_id or str(uuid.uuid4())
     img_data = await image.read()
@@ -7082,6 +7084,7 @@ async def api_audio_driven(
     pose_style: Optional[str] = Form(None),
     gaze_style: Optional[str] = Form(None),
     use_trt: bool = Form(False, description="Use TensorRT acceleration if available"),
+    voice_gender: str = Form("male", description="Voice gender: 'male' or 'female' (for Nepali TTS)"),
 ):
     temp_dir = Path(tempfile.mkdtemp())
     try:
@@ -7396,6 +7399,7 @@ async def api_tts_generate(
     min_p: float = Form(0.05),
     top_p: float = Form(1.0),
     repetition_penalty: float = Form(1.2),
+    voice_gender: str = Form("male", description="Voice gender: 'male' or 'female' (for Nepali TTS)"),
 ):
     """
     Generate speech from text with optional voice cloning.
@@ -7405,13 +7409,15 @@ async def api_tts_generate(
     Automatically detects Nepali language and uses Sherpa TTS for better quality.
     """
     # Check if text is Nepali and use Sherpa TTS if available
-    if SHERPA_AVAILABLE and detect_nepali(text) and app.state.sherpa_tts is not None:
-        logger.info(f"Detected Nepali text, using Sherpa TTS: '{text[:50]}...'")
+    if SHERPA_AVAILABLE and detect_nepali(text):
+        logger.info(f"Detected Nepali text, using Sherpa TTS ({voice_gender} voice): '{text[:50]}...'")
         try:
-            # Generate audio using Sherpa TTS
+            # Generate audio using Sherpa TTS with gender selection
+            from sherpa_tts_wrapper import get_sherpa_tts
             import soundfile as sf
-            audio_samples = app.state.sherpa_tts.generate(text, sid=5, speed=1.0)
-            sample_rate = app.state.sherpa_tts.sample_rate
+            sherpa_tts = get_sherpa_tts(voice=voice_gender)
+            audio_samples = sherpa_tts.generate(text, speed=1.0)
+            sample_rate = sherpa_tts.sample_rate
             
             # Convert to WAV bytes
             byte_io = io.BytesIO()
