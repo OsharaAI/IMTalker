@@ -95,15 +95,24 @@ logger = logging.getLogger(__name__)
 
 # Add current directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# Add Chatterbox Streaming path (at priority 0)
+# Add sherpa-TTS path for Nepali support
 sys.path.insert(
-    0, os.path.abspath(os.path.join(current_dir, "../chatterbox-streaming/src"))
+    0, os.path.abspath(os.path.join(current_dir, "../sherpa-TTS"))
 )
 sys.path.append(current_dir)
 
 # Import IMTalker components
 from imtalker_streamer import IMTalkerStreamer, IMTalkerConfig
 from remote_tts import RemoteChatterboxTTS
+
+# Import Sherpa TTS for Nepali language support
+try:
+    from sherpa_tts_wrapper import SherpaTTS, detect_nepali, is_sherpa_available
+    SHERPA_AVAILABLE = is_sherpa_available()
+except ImportError as e:
+    print(f"Warning: Could not import sherpa_tts_wrapper: {e}")
+    SHERPA_AVAILABLE = False
+    detect_nepali = lambda text: False
 
 # Try importing TensorRT handler for accelerated inference
 try:
@@ -310,6 +319,19 @@ async def lifespan(app: FastAPI):
 
     # TTS generation lock: only ONE TTS generation at a time to prevent CUDA OOM
     app.state.tts_lock = asyncio.Lock()
+    
+    # Initialize Sherpa TTS for Nepali language support
+    if SHERPA_AVAILABLE:
+        try:
+            from sherpa_tts_wrapper import get_sherpa_tts
+            app.state.sherpa_tts = get_sherpa_tts()
+            print("✅ Sherpa TTS initialized for Nepali language support")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize Sherpa TTS: {e}")
+            app.state.sherpa_tts = None
+    else:
+        app.state.sherpa_tts = None
+        print("ℹ️ Sherpa TTS not available (Nepali language not supported)")
 
     yield
     # Clean up models if necessary
@@ -1981,16 +2003,28 @@ class InferenceAgent:
         if audio_path:
             with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_out:
                 final_path = tmp_out.name
+            # Pre-process audio: apply fade-in/out to prevent click/pop artifacts
+            processed_audio_path = audio_path
+            try:
+                import soundfile as sf
+                aud_data, aud_sr = sf.read(audio_path, dtype='float32')
+                aud_data = apply_audio_chunk_fades(aud_data, sr=aud_sr, fade_ms=10.0)
+                processed_audio_path = audio_path + ".faded.wav"
+                sf.write(processed_audio_path, aud_data, aud_sr)
+            except Exception:
+                pass  # Fall back to original if processing fails
             # Use system FFmpeg (/usr/bin/ffmpeg) which has libx264, not conda FFmpeg
-            cmd = f'/usr/bin/ffmpeg -y -i "{raw_path}" -i "{audio_path}" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "{final_path}"'
+            cmd = f'/usr/bin/ffmpeg -y -i "{raw_path}" -i "{processed_audio_path}" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "{final_path}"'
             subprocess.call(cmd, shell=True)
             if os.path.exists(raw_path):
                 os.remove(raw_path)
+            if processed_audio_path != audio_path and os.path.exists(processed_audio_path):
+                os.remove(processed_audio_path)
             return final_path
         return raw_path
 
     @torch.no_grad()
-    def run_audio_inference(
+    def run_audio_inference( 
         self,
         img_pil,
         aud_path,
@@ -3041,6 +3075,8 @@ class ConversationManager:
         sync_manager=None,
         enable_realtime=True,
         webrtc_session_id=None,
+        full_img_rgb=None,
+        crop_coords=None,
     ):
         self.openai_client = openai_client
         self.tts_model = tts_model
@@ -3050,6 +3086,14 @@ class ConversationManager:
         self.avatar_img = avatar_img
         self.sync_manager = sync_manager
         self.webrtc_session_id = webrtc_session_id  # For Oshara log lookup
+
+        # Crop-Infer-Paste: when set, rendered 512x512 face frames are composited
+        # back into the full-resolution original image before sending to WebRTC.
+        self._full_img_rgb = full_img_rgb      # np.ndarray (H, W, 3) uint8, or None
+        self._crop_coords = crop_coords        # (x1, y1, x2, y2), or None
+        self._paste_back_enabled = full_img_rgb is not None and crop_coords is not None
+        if self._paste_back_enabled:
+            print(f"CM: Crop-Infer-Paste enabled — output will be {full_img_rgb.shape[1]}x{full_img_rgb.shape[0]}")
 
         # Frame interpolation settings
         self.enable_frame_blending = True  # Smooth transitions between chunks
@@ -3129,6 +3173,30 @@ class ConversationManager:
         except Exception as e:
             print(f"CM: Failed to connect Realtime session: {e}")
             self._realtime_connected = False
+
+    def paste_back_frame(self, frame_rgb: np.ndarray) -> np.ndarray:
+        """Paste a rendered 512x512 face frame back into the full-resolution image.
+        
+        If Crop-Infer-Paste is not enabled, returns the frame unchanged.
+        
+        Args:
+            frame_rgb: np.ndarray (H, W, 3) uint8 — rendered face frame (typically 512x512)
+        Returns:
+            np.ndarray (H, W, 3) uint8 — full-res image with face composited, or original frame
+        """
+        if not self._paste_back_enabled:
+            return frame_rgb
+        
+        x1, y1, x2, y2 = self._crop_coords
+        region_h, region_w = y2 - y1, x2 - x1
+        
+        # Resize rendered face to the crop region size
+        face_resized = cv2.resize(frame_rgb, (region_w, region_h), interpolation=cv2.INTER_LINEAR)
+        
+        # Composite into a copy of the full image
+        result = self._full_img_rgb.copy()
+        result[y1:y2, x1:x2] = face_resized
+        return result
 
     async def cleanup_async(self):
         """Async cleanup — disconnects Realtime session."""
@@ -3474,6 +3542,25 @@ class ConversationManager:
                     t_tts = time.time()
 
                     def do_tts(text):
+                        # Check if text is Nepali and use Sherpa TTS if available
+                        if SHERPA_AVAILABLE and detect_nepali(text) and hasattr(app.state, 'sherpa_tts') and app.state.sherpa_tts is not None:
+                            print(f"🇳🇵 Using Sherpa TTS for Nepali text: '{text[:50]}...'")
+                            try:
+                                # Generate audio using Sherpa TTS
+                                audio_np = app.state.sherpa_tts.generate(text, sid=5, speed=1.0)
+                                sherpa_sr = app.state.sherpa_tts.sample_rate
+                                
+                                # Resample to 24kHz if needed
+                                if sherpa_sr != 24000:
+                                    import librosa
+                                    audio_np = librosa.resample(audio_np, orig_sr=sherpa_sr, target_sr=24000)
+                                
+                                return audio_np.flatten().copy() if audio_np is not None else None
+                            except Exception as e:
+                                print(f"⚠️  Sherpa TTS failed for Nepali, falling back to STTS: {e}")
+                                # Fall through to use STTS
+                        
+                        # Use STTS for non-Nepali or as fallback
                         tts_stream = self.tts_model.generate_stream(
                             text=text,
                             chunk_size=15,
@@ -3519,6 +3606,7 @@ class ConversationManager:
             # ── Stage 3: Renderer ──
             # Takes audio from audio_queue, renders video, pushes A/V pairs to av_queue.
             _prev_chunk_last_rgb = [None]
+            _audio_crossfader = AudioChunkCrossfader(sr=24000, crossfade_ms=15.0)
             BLEND_FRAMES = 2
 
             async def renderer():
@@ -3557,6 +3645,8 @@ class ConversationManager:
                         audio_24k_clipped = (
                             audio_24k_np / peak if peak > 1.0 else audio_24k_np.copy()
                         )
+                        # Inter-chunk crossfade + DC removal to prevent clicks at boundaries
+                        audio_24k_clipped = _audio_crossfader.process(audio_24k_clipped)
 
                         expected_frames = (
                             total_audio_samples + SAMPLES_PER_FRAME - 1
@@ -3592,11 +3682,13 @@ class ConversationManager:
                                     ).astype(np.uint8)
 
                                 last_rgb = frame_rgb.copy()
+                                # Crop-Infer-Paste: composite face into full image
+                                output_rgb = self.paste_back_frame(frame_rgb)
                                 av_frame = VideoFrame.from_ndarray(
-                                    frame_rgb, format="rgb24"
+                                    output_rgb, format="rgb24"
                                 )
                                 last_av_frame = av_frame
-                                del ft, frame_rgb
+                                del ft, frame_rgb, output_rgb
 
                                 audio_slice = np.zeros(
                                     SAMPLES_PER_FRAME, dtype=np.float32
@@ -3882,6 +3974,7 @@ class ConversationManager:
             _prev_chunk_last_rgb_feed = [
                 None
             ]  # Shared mutable for cross-chunk blending
+            _audio_crossfader_feed = AudioChunkCrossfader(sr=24000, crossfade_ms=15.0)
             BLEND_FRAMES_FEED = 2  # Blend first 2 frames of each chunk
 
             async def renderer():
@@ -3928,6 +4021,8 @@ class ConversationManager:
                         audio_24k_clipped = (
                             audio_24k_np / peak if peak > 1.0 else audio_24k_np.copy()
                         )
+                        # Inter-chunk crossfade + DC removal to prevent clicks at boundaries
+                        audio_24k_clipped = _audio_crossfader_feed.process(audio_24k_clipped)
 
                         # ── Lip Sync: force exact frame-to-audio alignment ──
                         expected_frames = (
@@ -3968,11 +4063,13 @@ class ConversationManager:
                                     ).astype(np.uint8)
 
                                 last_rgb = frame_rgb.copy()
+                                # Crop-Infer-Paste: composite face into full image
+                                output_rgb = self.paste_back_frame(frame_rgb)
                                 av_frame = VideoFrame.from_ndarray(
-                                    frame_rgb, format="rgb24"
+                                    output_rgb, format="rgb24"
                                 )
                                 last_av_frame = av_frame
-                                del ft, frame_rgb
+                                del ft, frame_rgb, output_rgb
 
                                 # Exactly SAMPLES_PER_FRAME per frame (zero-pad last)
                                 audio_slice = np.zeros(
@@ -4211,6 +4308,7 @@ class ConversationManager:
                 del audio_parts
 
         # Stage 2: Render — generate video frames paired with audio slices
+        _audio_crossfader_greet = AudioChunkCrossfader(sr=24000, crossfade_ms=15.0)
         for audio_24k_np, text_chunk, chunk_idx in all_audio_chunks:
             total_audio_samples = len(audio_24k_np)
             t_render = time.time()
@@ -4235,6 +4333,8 @@ class ConversationManager:
 
                 peak = np.abs(audio_np).max()
                 audio_24k_clipped = audio_np / peak if peak > 1.0 else audio_np.copy()
+                # Inter-chunk crossfade + DC removal to prevent clicks at boundaries
+                audio_24k_clipped = _audio_crossfader_greet.process(audio_24k_clipped)
 
                 # ── Lip Sync: force exact frame-to-audio alignment ──
                 expected_frames = (
@@ -4254,9 +4354,11 @@ class ConversationManager:
                             continue  # Discard excess frames
 
                         frame_rgb = process_frame_tensor(ft, format="RGB")
-                        av_frame = VideoFrame.from_ndarray(frame_rgb, format="rgb24")
+                        # Crop-Infer-Paste: composite face into full image
+                        output_rgb = self.paste_back_frame(frame_rgb)
+                        av_frame = VideoFrame.from_ndarray(output_rgb, format="rgb24")
                         last_av_frame = av_frame
-                        del ft, frame_rgb
+                        del ft, frame_rgb, output_rgb
 
                         # Exactly SAMPLES_PER_FRAME per frame (zero-pad last)
                         audio_slice = np.zeros(SAMPLES_PER_FRAME, dtype=np.float32)
@@ -4692,14 +4794,27 @@ class IMTalkerVideoTrack(VideoStreamTrack):
     FRAME_DURATION = 1.0 / VIDEO_FPS  # 0.04s = 40ms per frame
     PTS_PER_FRAME = int(VIDEO_CLOCK_RATE / VIDEO_FPS)  # 3600
 
-    def __init__(self, avatar_img, sync_manager=None, idle_frames=None):
+    def __init__(self, avatar_img, sync_manager=None, idle_frames=None, full_img_rgb=None, crop_coords=None):
         super().__init__()
         self.avatar_img = avatar_img
         self.frame_queue = asyncio.Queue()  # VideoFrame objects from av_streamer
         self.sync_manager = sync_manager
-        self.static_idle_frame = np.array(avatar_img.convert("RGB"))
 
-        self._idle_frames = idle_frames or []
+        # Crop-Infer-Paste for idle frames
+        self._full_img_rgb = full_img_rgb    # np.ndarray (H, W, 3) uint8, or None
+        self._crop_coords = crop_coords      # (x1, y1, x2, y2), or None
+        self._paste_back_idle = full_img_rgb is not None and crop_coords is not None
+
+        if self._paste_back_idle:
+            # Static idle = full image (already has the face in it)
+            self.static_idle_frame = full_img_rgb.copy()
+        else:
+            self.static_idle_frame = np.array(avatar_img.convert("RGB"))
+
+        self._idle_frames = []
+        if idle_frames:
+            # set_idle_frames applies paste-back if needed
+            self.set_idle_frames(idle_frames)
         self._idle_index = 0
         self.is_speaking = False  # Set by av_streamer
         self._speech_ending = False  # True once all pairs pushed, queue draining
@@ -4717,8 +4832,22 @@ class IMTalkerVideoTrack(VideoStreamTrack):
         self._rush_next_frame = False  # Skip sleep on first speech frame
 
     def set_idle_frames(self, frames):
-        self._idle_frames = frames
-        print(f"VT: Idle animation set ({len(frames)} frames)")
+        if self._paste_back_idle:
+            # Paste-back each idle frame into the full image
+            x1, y1, x2, y2 = self._crop_coords
+            region_h, region_w = y2 - y1, x2 - x1
+            pasted_frames = []
+            for vf in frames:
+                face_rgb = vf.to_ndarray(format="rgb24")
+                face_resized = cv2.resize(face_rgb, (region_w, region_h), interpolation=cv2.INTER_LINEAR)
+                result = self._full_img_rgb.copy()
+                result[y1:y2, x1:x2] = face_resized
+                pasted_frames.append(VideoFrame.from_ndarray(result, format="rgb24"))
+            self._idle_frames = pasted_frames
+            print(f"VT: Idle animation set ({len(pasted_frames)} frames, paste-back applied)")
+        else:
+            self._idle_frames = frames
+            print(f"VT: Idle animation set ({len(frames)} frames)")
 
     def _get_idle_frame(self):
         """Get next idle animation frame with seamless looping."""
@@ -4960,6 +5089,8 @@ class IMTalkerAudioTrack(AudioStreamTrack):
 
     async def add_audio(self, audio_np):
         """Expects normalized float32 numpy array. Splits into WebRTC-sized frames."""
+        # Apply fade-in/out to prevent clicks at audio boundaries
+        audio_np = apply_audio_chunk_fades(audio_np, sr=self.sample_rate, fade_ms=10.0)
         audio_int16 = (audio_np * 32767).astype(np.int16)
         frame_size = self.samples_per_frame
         num_frames = len(audio_int16) // frame_size
@@ -5618,15 +5749,36 @@ async def webrtc_offer(request: Request):
 
         logger.info(f"Avatar processing time: {(time.time() - t_avatar)*1000:.2f}ms")
 
+        # Crop-Infer-Paste state: when crop=False, we detect the face, crop it
+        # for the model, but keep the full image + coords for paste-back after render.
+        full_img_rgb_for_paste = None  # np.ndarray (H, W, 3) of full image, or None
+        crop_coords_for_paste = None   # (x1, y1, x2, y2) tuple, or None
+
         if avatar_path and os.path.exists(avatar_path):
             logger.info(f"Using avatar from: {avatar_path}")
             avatar_img_raw = Image.open(avatar_path).convert("RGB")
-            # Apply crop if requested
             if crop and hasattr(app.state, "inference_agent"):
+                # crop=True: face-detect + crop to 512x512 (no paste-back)
                 logger.info("Applying face crop to avatar...")
                 avatar_img = app.state.inference_agent.data_processor.process_img(
                     avatar_img_raw
                 )
+            elif not crop and hasattr(app.state, "inference_agent"):
+                # crop=False: Crop-Infer-Paste mode
+                # Detect face, crop for model input, keep full image for paste-back
+                logger.info("Crop-Infer-Paste mode: detecting face for paste-back...")
+                dp = app.state.inference_agent.data_processor
+                img_arr = np.array(avatar_img_raw)
+                if img_arr.ndim == 2:
+                    img_arr = cv2.cvtColor(img_arr, cv2.COLOR_GRAY2RGB)
+                elif img_arr.shape[2] == 4:
+                    img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGBA2RGB)
+                crop_coords_for_paste = dp.get_crop_coords(img_arr)
+                x1, y1, x2, y2 = crop_coords_for_paste
+                cropped_face = img_arr[y1:y2, x1:x2]
+                avatar_img = Image.fromarray(cropped_face).resize((512, 512))
+                full_img_rgb_for_paste = img_arr  # Keep full-res original for paste-back
+                logger.info(f"Crop-Infer-Paste: face region ({x1},{y1})-({x2},{y2}), full image {img_arr.shape[1]}x{img_arr.shape[0]}")
             else:
                 avatar_img = avatar_img_raw.resize((512, 512))
         else:
@@ -5755,7 +5907,8 @@ async def webrtc_offer(request: Request):
 
         # Create Tracks with shared sync and idle animation
         video_track = IMTalkerVideoTrack(
-            avatar_img, sync_manager=sync_manager, idle_frames=idle_frames
+            avatar_img, sync_manager=sync_manager, idle_frames=idle_frames,
+            full_img_rgb=full_img_rgb_for_paste, crop_coords=crop_coords_for_paste,
         )
         audio_track = IMTalkerAudioTrack(sync_manager=sync_manager)
         # Audio is now pushed directly by av_streamer to both tracks separately
@@ -5823,6 +5976,8 @@ async def webrtc_offer(request: Request):
                 reference_audio=reference_audio,
                 sync_manager=sync_manager,
                 webrtc_session_id=session_id,
+                full_img_rgb=full_img_rgb_for_paste,
+                crop_coords=crop_coords_for_paste,
             )
             # Connect to OpenAI Realtime API (WebSocket for VAD + STT + LLM)
             await conv_manager.connect_realtime()
@@ -6076,6 +6231,96 @@ def save_video(frames, fps, output_path):
         # We need to process the frames
         pass
     out.release()
+
+
+def apply_audio_chunk_fades(audio_np: np.ndarray, sr: int = 24000, fade_ms: float = 10.0) -> np.ndarray:
+    """Apply DC-offset removal + fade-in/fade-out to an audio chunk.
+    
+    Args:
+        audio_np: float32 numpy audio array (1D mono or 2D multi-channel)
+        sr: sample rate
+        fade_ms: fade duration in milliseconds
+    Returns:
+        Audio with DC removed and fades applied (copy)
+    """
+    if audio_np.size == 0:
+        return audio_np
+    audio = audio_np.copy().astype(np.float32)
+    # Remove DC offset — prevents step-discontinuity clicks between chunks
+    if audio.ndim == 1:
+        audio -= np.mean(audio)
+    else:
+        audio -= np.mean(audio, axis=0, keepdims=True)
+    # Number of samples along the time axis
+    n_samples = audio.shape[0]
+    fade_samples = int(fade_ms / 1000.0 * sr)
+    fade_samples = min(fade_samples, n_samples // 4)  # Don't fade more than 25%
+    if fade_samples > 0:
+        fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+        fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+        # Handle both 1D (mono) and 2D (multi-channel) arrays
+        if audio.ndim == 2:
+            fade_in = fade_in[:, np.newaxis]
+            fade_out = fade_out[:, np.newaxis]
+        audio[:fade_samples] *= fade_in
+        audio[-fade_samples:] *= fade_out
+    return audio
+
+
+class AudioChunkCrossfader:
+    """Stateful crossfader that blends consecutive audio chunks at their boundaries.
+
+    Instead of independently fading each chunk (which creates amplitude dips
+    at boundaries), this keeps the tail of each chunk and crossfades it with
+    the head of the next chunk.  Only the very first chunk gets a fade-in and
+    the very last chunk gets a fade-out; intermediate boundaries are seamless.
+    """
+
+    def __init__(self, sr: int = 24000, crossfade_ms: float = 15.0):
+        self.sr = sr
+        self.crossfade_samples = int(crossfade_ms / 1000.0 * sr)
+        self._prev_tail = None   # float32 tail AFTER fade-out (for continuity)
+        self._prev_tail_raw = None  # float32 tail BEFORE fade-out (for crossfade)
+        self._is_first = True
+
+    def process(self, audio_np: np.ndarray) -> np.ndarray:
+        """Process one chunk.  Returns audio with DC removed + crossfade applied.
+
+        Call once per sentence/text chunk in order.
+        """
+        if audio_np.size == 0:
+            return audio_np
+
+        audio = audio_np.copy().astype(np.float32)
+        # Remove DC offset
+        audio -= np.mean(audio)
+
+        xf = min(self.crossfade_samples, len(audio) // 4)
+
+        if self._prev_tail_raw is not None and xf > 0:
+            # Inter-chunk crossfade: blend previous chunk's ending with this chunk's beginning.
+            # `_prev_tail_raw` was saved BEFORE fade-out, so it's at real amplitude.
+            # We use it to create a smooth bridge: old audio fades out while new fades in.
+            tail = self._prev_tail_raw
+            blend = min(xf, len(tail), len(audio))
+            if blend > 0:
+                fo = np.linspace(1.0, 0.0, blend, dtype=np.float32)
+                fi = np.linspace(0.0, 1.0, blend, dtype=np.float32)
+                audio[:blend] = tail[-blend:] * fo + audio[:blend] * fi
+        elif self._is_first and xf > 0:
+            # Very first chunk — fade-in from silence
+            audio[:xf] *= np.linspace(0.0, 1.0, xf, dtype=np.float32)
+            self._is_first = False
+
+        # Save tail BEFORE fade-out (raw) for crossfade with next chunk
+        tail_len = min(xf, len(audio))
+        if tail_len > 0:
+            self._prev_tail_raw = audio[-tail_len:].copy()
+            # Apply fade-out to rendered audio (smooth ending if last chunk,
+            # or graceful silence transition if next chunk takes time to arrive)
+            audio[-tail_len:] *= np.linspace(1.0, 0.0, tail_len, dtype=np.float32)
+
+        return audio
 
 
 def process_frame_tensor(frame_tensor, format="BGR"):
@@ -6952,7 +7197,41 @@ async def api_tts_generate(
     Generate speech from text with optional voice cloning.
     Splits long text into segments to avoid CUDA positional encoding overflow.
     Uses a lock to prevent concurrent GPU access and aggressive memory cleanup.
+    
+    Automatically detects Nepali language and uses Sherpa TTS for better quality.
     """
+    # Check if text is Nepali and use Sherpa TTS if available
+    if SHERPA_AVAILABLE and detect_nepali(text) and app.state.sherpa_tts is not None:
+        logger.info(f"Detected Nepali text, using Sherpa TTS: '{text[:50]}...'")
+        try:
+            # Generate audio using Sherpa TTS
+            import soundfile as sf
+            audio_samples = app.state.sherpa_tts.generate(text, sid=5, speed=1.0)
+            sample_rate = app.state.sherpa_tts.sample_rate
+            
+            # Convert to WAV bytes
+            byte_io = io.BytesIO()
+            with wave.open(byte_io, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)  # 16-bit
+                wav_file.setframerate(sample_rate)
+                
+                # Normalize and convert to int16
+                audio_np = np.array(audio_samples, dtype=np.float32)
+                peak = np.max(np.abs(audio_np))
+                if peak > 1.0:
+                    audio_np = audio_np / peak
+                audio_int16 = (audio_np * 32767).astype(np.int16)
+                wav_file.writeframes(audio_int16.tobytes())
+            
+            byte_io.seek(0)
+            logger.info(f"Sherpa TTS generated {len(audio_samples)} samples at {sample_rate}Hz")
+            return StreamingResponse(byte_io, media_type="audio/wav")
+        except Exception as e:
+            logger.error(f"Sherpa TTS failed, falling back to STTS: {e}")
+            # Fall through to use STTS server
+    
+    # Use STTS server for non-Nepali languages or as fallback
     # Acquire the TTS lock — only one generation at a time to prevent CUDA OOM
     async with app.state.tts_lock:
         try:
