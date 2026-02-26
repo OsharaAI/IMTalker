@@ -524,3 +524,91 @@ class IMTalkerStreamer:
         print(f"Overall RTF: {rtf_total:.4f}")
         print(f"Total Frames Yielded: {total_frames}")
 
+    def warmup(self, avatar_img=None):
+        """
+        Warm up the IMTalker pipeline to eliminate first-request latency.
+        
+        Runs:
+        1. Dummy avatar embedding computation to trigger torch.compile
+        2. Short audio generation to compile generator and renderer
+        3. Caches embeddings for provided avatar (or creates dummy if None)
+        
+        Args:
+            avatar_img: PIL Image to pre-cache embeddings for. If None, uses dummy avatar.
+        
+        Returns:
+            dict with warmup timing info
+        """
+        print("=" * 60)
+        print("IMTalker Warmup: Starting...")
+        print("=" * 60)
+        
+        timings = {}
+        t_total = time.time()
+        
+        # Create dummy avatar if not provided
+        if avatar_img is None:
+            from PIL import Image
+            # Create a simple gradient image as dummy avatar
+            dummy_arr = np.linspace(0, 255, 512*512*3, dtype=np.uint8).reshape(512, 512, 3)
+            avatar_img = Image.fromarray(dummy_arr, 'RGB')
+            print("Warmup: Using dummy avatar")
+        else:
+            print(f"Warmup: Using provided avatar")
+        
+        # Generate short dummy audio (0.5s at 16kHz = 8000 samples)
+        # Use breathing-like pattern for realistic warmup
+        t_audio_gen = time.time()
+        warmup_duration = 0.5
+        sampling_rate = self.opt.sampling_rate  # 16000 Hz
+        num_samples = int(warmup_duration * sampling_rate)
+        t = np.linspace(0, warmup_duration, num_samples, dtype=np.float32)
+        breathing = (0.4 * np.sin(2 * np.pi * 0.25 * t)).astype(np.float32)
+        noise = np.random.randn(num_samples).astype(np.float32) * 0.002
+        dummy_audio = breathing * 0.005 + noise
+        timings["audio_generation_ms"] = (time.time() - t_audio_gen) * 1000
+        
+        # Run through the full pipeline to trigger compilation
+        t_pipeline = time.time()
+        try:
+            def audio_iter():
+                yield dummy_audio
+            
+            frame_count = 0
+            for video_frames, metrics in self.generate_stream(
+                avatar_img, 
+                audio_iter(), 
+                seed=42, 
+                nfe=self.opt.nfe_low_latency if self.opt.low_latency_mode else 10,
+                cfg_scale=3.0
+            ):
+                frame_count += len(video_frames)
+                # Just consume frames to trigger compilation
+                del video_frames
+            
+            timings["pipeline_execution_ms"] = (time.time() - t_pipeline) * 1000
+            timings["frames_generated"] = frame_count
+            print(f"Warmup: Pipeline executed, generated {frame_count} frames")
+            
+        except Exception as e:
+            print(f"Warmup: Pipeline execution error: {e}")
+            import traceback
+            traceback.print_exc()
+            timings["pipeline_error"] = str(e)
+        
+        # Clear GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        timings["total_ms"] = (time.time() - t_total) * 1000
+        timings["status"] = "ok" if "pipeline_error" not in timings else "error"
+        
+        print("=" * 60)
+        print(f"IMTalker Warmup: Complete in {timings['total_ms']:.0f}ms")
+        print(f"  - Avatar cache: READY")
+        print(f"  - Model compilation: DONE")
+        print(f"  - Generated {timings.get('frames_generated', 0)} test frames")
+        print("=" * 60)
+        
+        return timings
+

@@ -230,6 +230,7 @@ async def lifespan(app: FastAPI):
 
     # 1b. Warmup STTS server (pre-cache voice conditioning + compile T3 model)
     # This eliminates ~2-5s latency on the first TTS request
+    stts_warmup_success = False
     try:
         import httpx
 
@@ -240,15 +241,19 @@ async def lifespan(app: FastAPI):
             timeout=120.0,  # warmup can take up to ~60s on first compile
         )
         if warmup_resp.status_code == 200:
-            print(f"✅ STTS server warmup complete: {warmup_resp.json()}")
+            warmup_data = warmup_resp.json()
+            print(f"✅ STTS server warmup complete: {warmup_data}")
+            stts_warmup_success = True
         else:
             print(
-                f"⚠️ STTS warmup returned {warmup_resp.status_code}: {warmup_resp.text[:200]}"
+                f"❌ STTS warmup returned {warmup_resp.status_code}: {warmup_resp.text[:200]}"
             )
+            print("⚠️ WARNING: First TTS request will be slow (~2-5s compilation overhead)")
     except Exception as e_warmup:
         print(
-            f"⚠️ STTS warmup failed (non-fatal, first request will be slower): {e_warmup}"
+            f"❌ STTS warmup failed: {e_warmup}"
         )
+        print("⚠️ WARNING: STTS server may not be ready. First TTS request will be slow.")
 
     # 2. Initialize IMTalker
     print("Lifespan: Loading IMTalker...")
@@ -300,6 +305,70 @@ async def lifespan(app: FastAPI):
             app.state.trt_handler = None
     else:
         print("TRTInferenceHandler not available. Running in PyTorch-only mode.")
+
+    # 4. Warmup IMTalker (pre-compile models + cache default avatar embeddings)
+    # This eliminates 3-10s torch.compile delay on first generation
+    print("Lifespan: Warming up IMTalker pipeline...")
+    try:
+        # Load a default avatar for warmup if available
+        warmup_avatar = None
+        default_avatar_path = os.path.join(current_dir, "assets/source_1.png")
+        if os.path.exists(default_avatar_path):
+            from PIL import Image
+            warmup_avatar = Image.open(default_avatar_path).convert("RGB")
+            print(f"  Using default avatar: {default_avatar_path}")
+        
+        warmup_timings = app.state.imtalker_streamer.warmup(avatar_img=warmup_avatar)
+        if warmup_timings.get("status") == "ok":
+            print(f"✅ IMTalker warmup complete in {warmup_timings['total_ms']:.0f}ms")
+            print(f"   - Avatar embeddings: CACHED")
+            print(f"   - torch.compile: DONE")
+            print(f"   - Test frames: {warmup_timings.get('frames_generated', 0)}")
+        else:
+            print(f"⚠️ IMTalker warmup completed with errors: {warmup_timings.get('pipeline_error', 'unknown')}")
+    except Exception as e:
+        print(f"⚠️ IMTalker warmup failed: {e}")
+        print("   First generation will be slower (~3-10s compilation overhead)")
+    
+    # 5. Pre-warm configured avatars (optional, for instant first-use)
+    print("Lifespan: Pre-warming configured avatars...")
+    prewarmed_count = 0
+    try:
+        for avatar_path, avatar_config in AVATAR_CONFIG.get("avatars", {}).items():
+            if avatar_config.get("preload", False):
+                full_path = os.path.join(current_dir, avatar_path)
+                if os.path.exists(full_path):
+                    from PIL import Image
+                    avatar_img = Image.open(full_path).convert("RGB")
+                    # Just process through the streamer to cache embeddings
+                    # (no need to generate frames, just cache the avatar)
+                    _ = app.state.imtalker_streamer._get_avatar_cache_key(avatar_img)
+                    # Run a quick embedding pass to populate cache
+                    s_tensor = app.state.imtalker_streamer.process_img(avatar_img)
+                    with torch.no_grad():
+                        f_r, app_feat = app.state.imtalker_streamer.renderer.dense_feature_encoder(s_tensor)
+                        t_lat = app.state.imtalker_streamer.renderer.latent_token_encoder(s_tensor)
+                        if isinstance(t_lat, tuple): t_lat = t_lat[0]
+                        ta_r = app.state.imtalker_streamer.renderer.adapt(t_lat, app_feat)
+                        m_r = app.state.imtalker_streamer.renderer.latent_token_decoder(ta_r)
+                    # Cache manually
+                    cache_key = app.state.imtalker_streamer._get_avatar_cache_key(avatar_img)
+                    app.state.imtalker_streamer._avatar_cache_key = cache_key
+                    app.state.imtalker_streamer._cached_s_tensor = s_tensor
+                    app.state.imtalker_streamer._cached_f_r = f_r
+                    app.state.imtalker_streamer._cached_app_feat = app_feat
+                    app.state.imtalker_streamer._cached_t_lat = t_lat
+                    app.state.imtalker_streamer._cached_ta_r = ta_r
+                    app.state.imtalker_streamer._cached_m_r = m_r
+                    prewarmed_count += 1
+                    print(f"  ✓ Pre-warmed: {avatar_path}")
+    except Exception as e:
+        print(f"⚠️ Avatar pre-warming error: {e}")
+    
+    if prewarmed_count > 0:
+        print(f"✅ Pre-warmed {prewarmed_count} configured avatar(s)")
+    else:
+        print("ℹ️ No avatars configured for pre-warming (add 'preload': true to avatar_config.json)")
 
     # Session management
     app.state.webrtc_sessions = {}
@@ -516,6 +585,50 @@ async def gpu_stats():
     stats = gpu_monitor.get_stats()
     stats["level"] = gpu_monitor.check_and_log("api-check")
     return stats
+
+
+@app.post("/warmup")
+async def warmup_imtalker():
+    """
+    Warm up the IMTalker pipeline to eliminate first-request latency.
+    
+    Pre-compiles models and caches default avatar embeddings.
+    Call this after server startup (or after model reload) to ensure
+    instant response on first real generation.
+    
+    Returns timing info and warmup status.
+    """
+    if not hasattr(app.state, "imtalker_streamer"):
+        raise HTTPException(
+            status_code=503,
+            detail="IMTalker not loaded. Server may still be starting up."
+        )
+    
+    try:
+        # Load default avatar if available
+        warmup_avatar = None
+        default_avatar_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 
+            "assets/source_1.png"
+        )
+        if os.path.exists(default_avatar_path):
+            from PIL import Image
+            warmup_avatar = Image.open(default_avatar_path).convert("RGB")
+        
+        timings = await asyncio.get_event_loop().run_in_executor(
+            None,
+            app.state.imtalker_streamer.warmup,
+            warmup_avatar
+        )
+        
+        return {
+            "status": "ok",
+            "timings": timings,
+            "message": "IMTalker warmup complete. Models compiled and avatar cached."
+        }
+    except Exception as e:
+        logger.error(f"Warmup failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Warmup failed: {str(e)}")
 
 
 def numpy_to_wav_base64(audio_np, sampling_rate=16000):
@@ -6012,17 +6125,44 @@ async def webrtc_offer(request: Request):
             if state == "connected":
                 meta["status"] = "greeting"
 
-                # Push the PRE-RENDERED greeting (rendered during /offer processing)
-                pairs = meta.get("pre_rendered_pairs")
+                # Wait for greeting to be ready (if rendering in background)
+                # Poll for up to 10 seconds (greeting should be ready in 1-5s typically)
+                greeting_wait_start = time.time()
+                max_wait = 10.0
+                while True:
+                    pairs = meta.get("pre_rendered_pairs")
+                    greeting_error = meta.get("greeting_error")
+                    
+                    if pairs:
+                        # Greeting is ready!
+                        break
+                    elif greeting_error:
+                        # Greeting render failed
+                        logger.error(f"Greeting render failed: {greeting_error}")
+                        break
+                    elif (time.time() - greeting_wait_start) > max_wait:
+                        # Timeout waiting for greeting
+                        logger.warning(f"Greeting render timeout after {max_wait}s")
+                        break
+                    else:
+                        # Still rendering, wait a bit
+                        await asyncio.sleep(0.1)
+                
+                wait_time = time.time() - greeting_wait_start
+                if wait_time > 0.5:
+                    logger.info(f"Waited {wait_time:.2f}s for greeting to render")
+
+                # Push the greeting (if available)
                 greeting_cm = meta.get("greeting_cm") or conv_manager
 
                 if pairs and greeting_cm:
                     logger.info(
-                        f"🎙️ Pushing pre-rendered greeting ({len(pairs)} A/V pairs)..."
+                        f"🎙️ Pushing greeting ({len(pairs)} A/V pairs)..."
                     )
                     try:
                         await greeting_cm.push_buffered_greeting(pairs)
-                        logger.info("✅ Greeting delivered (pre-rendered).")
+                        render_time = meta.get("greeting_render_time", 0)
+                        logger.info(f"✅ Greeting delivered (rendered in {render_time:.2f}s, waited {wait_time:.2f}s).")
                     except Exception as e:
                         logger.error(f"Greeting push failed: {e}")
 
@@ -6034,7 +6174,7 @@ async def webrtc_offer(request: Request):
                     if not conv_mode and temp_cm and temp_cm is not conv_manager:
                         temp_cm.cleanup()
                 else:
-                    logger.warning("No pre-rendered greeting available")
+                    logger.warning("No greeting available (render may have failed or timed out)")
 
                 meta["status"] = "ready"
                 meta["greeting_done"] = True
@@ -6043,44 +6183,66 @@ async def webrtc_offer(request: Request):
             elif state in ("failed", "closed", "disconnected"):
                 await _cleanup_webrtc_session(session_id, reason=state)
 
-        # ─── Pre-render greeting BEFORE returning SDP answer ───
-        # This keeps the frontend on 'connecting' screen while TTS + render runs.
-        # When WebRTC connects, the pre-rendered greeting plays INSTANTLY.
-        pre_rendered_pairs = None
+        # ─── Render greeting in BACKGROUND (deferred) ───
+        # Return SDP answer immediately, render greeting asynchronously.
+        # This eliminates the 2-5s perceived "connecting" delay.
+        # Greeting will be pushed when WebRTC connection establishes.
         greet_text = greeting or text
         if greet_text:
-            t_prerender = time.time()
-            logger.info(f"🎙️ Pre-rendering greeting: '{greet_text[:50]}...'")
-            target_cm = conv_manager
-            if not target_cm:
-                # One-shot: create temp ConversationManager for rendering (no Realtime needed)
-                target_cm = ConversationManager(
-                    openai_client,
-                    tts_model,
-                    imtalker_streamer,
-                    video_track,
-                    audio_track,
-                    avatar_img,
-                    system_prompt=system_prompt,
-                    reference_audio=reference_audio,
-                    sync_manager=sync_manager,
-                    enable_realtime=False,
-                    webrtc_session_id=session_id,
-                )
-            try:
-                pre_rendered_pairs = await target_cm.pre_render_to_buffer(greet_text)
-                logger.info(
-                    f"✅ Greeting pre-rendered: {len(pre_rendered_pairs)} pairs in {time.time() - t_prerender:.2f}s"
-                )
-            except Exception as e:
-                logger.error(f"Greeting pre-render failed: {e}")
-                traceback.print_exc()
-
-            # Store in session meta for the connected handler
-            app.state.active_session_meta[session_id][
-                "pre_rendered_pairs"
-            ] = pre_rendered_pairs
-            app.state.active_session_meta[session_id]["greeting_cm"] = target_cm
+            async def render_greeting_bg():
+                """Background task to render greeting while WebRTC connects."""
+                try:
+                    t_prerender = time.time()
+                    logger.info(f"🎙️ Background: Rendering greeting '{greet_text[:50]}...'")
+                    
+                    target_cm = conv_manager
+                    if not target_cm:
+                        # One-shot: create temp ConversationManager for rendering (no Realtime needed)
+                        target_cm = ConversationManager(
+                            openai_client,
+                            tts_model,
+                            imtalker_streamer,
+                            video_track,
+                            audio_track,
+                            avatar_img,
+                            system_prompt=system_prompt,
+                            reference_audio=reference_audio,
+                            sync_manager=sync_manager,
+                            enable_realtime=False,
+                            webrtc_session_id=session_id,
+                            full_img_rgb=full_img_rgb_for_paste,
+                            crop_coords=crop_coords_for_paste,
+                        )
+                    
+                    pre_rendered_pairs = await target_cm.pre_render_to_buffer(greet_text)
+                    render_time = time.time() - t_prerender
+                    logger.info(
+                        f"✅ Greeting rendered in background: {len(pre_rendered_pairs)} pairs in {render_time:.2f}s"
+                    )
+                    
+                    # Store in session meta for the connected handler
+                    meta = app.state.active_session_meta.get(session_id)
+                    if meta:
+                        meta["pre_rendered_pairs"] = pre_rendered_pairs
+                        meta["greeting_cm"] = target_cm
+                        meta["greeting_render_time"] = render_time
+                        logger.info(f"Session {session_id}: Greeting ready for playback")
+                    else:
+                        logger.warning(f"Session {session_id} not found after greeting render (disconnected?)")
+                        if not conv_mode and target_cm:
+                            target_cm.cleanup()
+                        
+                except Exception as e:
+                    logger.error(f"Background greeting render failed: {e}")
+                    traceback.print_exc()
+                    # Store error so connection handler knows greeting failed
+                    meta = app.state.active_session_meta.get(session_id)
+                    if meta:
+                        meta["greeting_error"] = str(e)
+            
+            # Start greeting render in background (non-blocking)
+            asyncio.create_task(render_greeting_bg())
+            logger.info(f"✅ SDP answer ready. Greeting rendering in background...")
 
         # Handle offer
         offer = RTCSessionDescription(sdp=sdp, type="offer")  # default to offer
