@@ -180,21 +180,21 @@ def resolve_avatar_voice(avatar_path: str, tts_model) -> dict:
     return config
 
 
-# Import Chatterbox
-# Try to import from installed package or local if needed
-try:
-    import chatterbox
+# # Import Chatterbox
+# # Try to import from installed package or local if needed
+# try:
+#     import chatterbox
 
-    print(f"Chatterbox imported from: {chatterbox.__file__}")
-    from chatterbox.tts import ChatterboxTTS
-except ImportError as e:
-    print(f"Could not import chatterbox.tts: {e}")
-    # print sys.path for debugging
-    print(f"sys.path: {sys.path}")
-    import traceback
+#     print(f"Chatterbox imported from: {chatterbox.__file__}")
+#     from chatterbox.tts import ChatterboxTTS
+# except ImportError as e:
+#     print(f"Could not import chatterbox.tts: {e}")
+#     # print sys.path for debugging
+#     print(f"sys.path: {sys.path}")
+#     import traceback
 
-    traceback.print_exc()
-    sys.exit(1)
+#     traceback.print_exc()
+#     sys.exit(1)
 
 # --- FastAPI Implementation ---
 
