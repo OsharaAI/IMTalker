@@ -3202,6 +3202,63 @@ class OpenAIRealtimeSession:
         return self._connected
 
 
+# --- Streaming Sentence Accumulator ---
+
+
+class StreamingSentenceAccumulator:
+    """Accumulates streaming tokens from OpenAI Realtime API and emits
+    complete sentences as soon as sentence boundaries are detected.
+
+    This allows TTS to start on the first sentence while the LLM is still
+    generating subsequent sentences, saving ~500-1500ms on first-frame latency.
+    """
+
+    # Regex pattern for sentence boundaries: period, !, ? followed by space or end
+    _SENTENCE_END = re.compile(r'[.!?](?:\s|$)')
+
+    def __init__(self, sentence_queue: asyncio.Queue):
+        self.buffer = ""
+        self.sentence_index = 0
+        self.sentence_queue = sentence_queue
+        self._pipeline_started = False
+        self._response_text = ""  # Full response accumulation for logging
+
+    async def add_token(self, token: str):
+        """Called per-token from OpenAI response.text.delta."""
+        self.buffer += token
+        self._response_text += token
+
+        # Check for sentence boundary in buffer
+        match = self._SENTENCE_END.search(self.buffer)
+        if match:
+            end_pos = match.end()
+            sentence = self.buffer[:end_pos].strip()
+            self.buffer = self.buffer[end_pos:].lstrip()
+            if sentence:
+                await self.sentence_queue.put(sentence)
+                self.sentence_index += 1
+
+    async def flush(self):
+        """Called on response.done — emit any remaining buffered text."""
+        remaining = self.buffer.strip()
+        if remaining:
+            await self.sentence_queue.put(remaining)
+            self.sentence_index += 1
+            self.buffer = ""
+        await self.sentence_queue.put(None)  # Sentinel: end of response
+
+    def reset(self):
+        """Reset for next response."""
+        self.buffer = ""
+        self.sentence_index = 0
+        self._pipeline_started = False
+        self._response_text = ""
+
+    @property
+    def full_text(self):
+        return self._response_text
+
+
 # --- Conversation Manager ---
 
 
@@ -3288,10 +3345,23 @@ class ConversationManager:
         self._pipeline_total_time = None
         self._pipeline_total_frames = None
 
+        # ── Streaming sentence accumulator (Optimization: token-level pipelining) ──
+        # Instead of waiting for the full LLM response, we detect sentence
+        # boundaries in the token stream and start TTS/render immediately.
+        self._streaming_sentence_queue = asyncio.Queue(maxsize=6)
+        self._sentence_accumulator = StreamingSentenceAccumulator(
+            self._streaming_sentence_queue
+        )
+
+        # ── Thinking transition state ──
+        self._thinking_active = False
+
         # ── OpenAI Realtime API Session ──
         # Replaces: local VAD + Whisper STT + ChatCompletions LLM
         # The Realtime API handles VAD, transcription, conversation context,
         # and generates text responses. We feed those into our TTS→render pipeline.
+        # OPTIMIZED: Uses on_response_text_delta for per-token streaming instead
+        # of waiting for the full response (saves ~500-1500ms on first frame).
         self.realtime_session = None
         self._realtime_connected = False
         if enable_realtime:
@@ -3299,7 +3369,8 @@ class ConversationManager:
             self.realtime_session = OpenAIRealtimeSession(
                 api_key=api_key,
                 system_prompt=self.system_prompt,
-                on_response_text=self._on_realtime_response,
+                on_response_text=self._on_streaming_response_done,
+                on_response_text_delta=self._on_streaming_token,
                 on_speech_started=self._on_realtime_speech_started,
                 on_speech_stopped=self._on_realtime_speech_stopped,
                 on_user_transcript=self._on_realtime_user_transcript,
@@ -3384,6 +3455,14 @@ class ConversationManager:
         self.audio_track = None
         self.avatar_img = None
         self.last_chunk_final_frame = None
+        self._thinking_active = False
+
+        # Drain streaming sentence queue
+        while not self._streaming_sentence_queue.empty():
+            try:
+                self._streaming_sentence_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
         # Cancel any pending processing task
         if self._processing_task and not self._processing_task.done():
@@ -3391,27 +3470,69 @@ class ConversationManager:
 
         print("CM: Cleanup complete.")
 
-    # ── OpenAI Realtime API Callbacks ──
+    # ── OpenAI Realtime API Callbacks (Streaming Pipeline) ──
 
-    async def _on_realtime_response(self, full_text: str):
-        """Called when the Realtime API produces a complete text response.
+    async def _on_streaming_token(self, delta: str):
+        """Called per-token from OpenAI response.text.delta.
 
-        This replaces the old LLM streaming stage. We receive the full text
-        and split it into sentences, then feed them through TTS → render → WebRTC.
+        Feeds tokens into the StreamingSentenceAccumulator which detects
+        sentence boundaries and pushes complete sentences to the pipeline.
+        The pipeline starts on the FIRST sentence — not the full response.
         """
-        print(f"CM: Realtime response received: '{full_text[:80]}...'")
+        # If this is the very first token of a new response, create a fresh queue
+        if self._sentence_accumulator._response_text == "":
+            # Fresh queue for this response (old pipeline drains the old one)
+            self._streaming_sentence_queue = asyncio.Queue(maxsize=6)
+            self._sentence_accumulator.sentence_queue = self._streaming_sentence_queue
+
+        await self._sentence_accumulator.add_token(delta)
+
+        # Start the streaming pipeline as soon as the first sentence is ready
+        if not self._sentence_accumulator._pipeline_started and self._sentence_accumulator.sentence_index > 0:
+            self._sentence_accumulator._pipeline_started = True
+
+            # Stop thinking animation if active
+            self._thinking_active = False
+
+            # Measure LLM latency to first sentence
+            llm_latency = None
+            if hasattr(self, '_last_user_msg_time') and self._last_user_msg_time:
+                llm_latency = round(time.time() - self._last_user_msg_time, 3)
+            self._current_pipeline_start = time.time()
+            self._current_llm_latency = llm_latency
+            print(f"CM: First sentence detected at {llm_latency}s — starting streaming pipeline")
+
+            # Cancel any existing pipeline
+            if self._processing_task and not self._processing_task.done():
+                self._processing_task.cancel()
+                try:
+                    await self._processing_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # Start concurrent pipeline consuming from _streaming_sentence_queue
+            self._processing_task = asyncio.create_task(
+                self._run_streaming_pipeline()
+            )
+
+    async def _on_streaming_response_done(self, full_text: str):
+        """Called when OpenAI response.done fires — flush any remaining text.
+
+        If the accumulator never fired (very short response), fall back to
+        the original full-text pipeline.
+        """
+        full_text = full_text.strip() if full_text else self._sentence_accumulator.full_text.strip()
+        print(f"CM: Realtime response complete: '{full_text[:80]}...'")
 
         # Mirror to local history for logging
-        self.conversation_history.append({"role": "assistant", "content": full_text})
+        if full_text:
+            self.conversation_history.append({"role": "assistant", "content": full_text})
 
-        # Measure LLM response latency (time from user message to AI response)
-        llm_latency = None
-        if hasattr(self, '_last_user_msg_time') and self._last_user_msg_time:
+        # Record to Oshara conversation logs
+        llm_latency = self._current_llm_latency
+        if llm_latency is None and hasattr(self, '_last_user_msg_time') and self._last_user_msg_time:
             llm_latency = round(time.time() - self._last_user_msg_time, 3)
-        self._current_pipeline_start = time.time()
-        self._current_llm_latency = llm_latency
-
-        # ── Record to Oshara conversation logs (timings will be updated at pipeline end) ──
+            self._current_llm_latency = llm_latency
         _record_oshara_log(
             app,
             response=full_text,
@@ -3425,17 +3546,35 @@ class ConversationManager:
                 -(self.max_history_turns * 2) :
             ]
 
-        # Cancel any existing pipeline and start a new one
-        if self._processing_task and not self._processing_task.done():
-            self._processing_task.cancel()
-            try:
-                await self._processing_task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if not self._sentence_accumulator._pipeline_started:
+            # Very short response (no sentence boundary detected during streaming)
+            # Fall back: put entire text + sentinel into queue and start pipeline
+            self._sentence_accumulator._pipeline_started = True
+            self._thinking_active = False
 
-        self._processing_task = asyncio.create_task(
-            self.process_response_text(full_text)
-        )
+            if not self._current_pipeline_start:
+                self._current_pipeline_start = time.time()
+
+            if self._processing_task and not self._processing_task.done():
+                self._processing_task.cancel()
+                try:
+                    await self._processing_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            if full_text:
+                await self._streaming_sentence_queue.put(full_text)
+            await self._streaming_sentence_queue.put(None)
+
+            self._processing_task = asyncio.create_task(
+                self._run_streaming_pipeline()
+            )
+        else:
+            # Normal path: flush remaining buffered text and send sentinel
+            await self._sentence_accumulator.flush()
+
+        # Reset accumulator for next response
+        self._sentence_accumulator.reset()
 
     async def _on_realtime_speech_started(self):
         """Called when OpenAI server VAD detects user started speaking.
@@ -3522,6 +3661,19 @@ class ConversationManager:
         # Cancel any in-progress response from Realtime API
         await self.realtime_session.cancel_response()
 
+        # Stop thinking animation
+        self._thinking_active = False
+
+        # Reset sentence accumulator to prevent stale tokens from old response
+        self._sentence_accumulator.reset()
+
+        # Drain streaming sentence queue
+        while not self._streaming_sentence_queue.empty():
+            try:
+                self._streaming_sentence_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
         # Cancel our TTS/render pipeline
         if self._processing_task and not self._processing_task.done():
             self._processing_task.cancel()
@@ -3560,9 +3712,41 @@ class ConversationManager:
         print("🛑 BARGE-IN: Pipeline cancelled, tracks flushed — listening to user")
 
     async def _on_realtime_speech_stopped(self):
-        """Called when OpenAI server VAD detects user stopped speaking."""
+        """Called when OpenAI server VAD detects user stopped speaking.
+
+        Starts a subtle 'thinking' transition on the idle animation to
+        fill the visual gap while LLM generates the response (~500-1500ms).
+        This makes the avatar feel responsive even before speech starts.
+        """
         print("CM: User speech stopped (OpenAI VAD)")
         self.user_is_talking = False
+
+        # Start thinking transition if not already speaking
+        if not self.is_speaking and self.video_track and hasattr(self.video_track, '_idle_frames') and self.video_track._idle_frames:
+            self._thinking_active = True
+            asyncio.create_task(self._play_thinking_transition())
+
+    async def _play_thinking_transition(self):
+        """Push sped-up idle frames to give a subtle 'thinking' animation.
+
+        Runs until the streaming pipeline starts (first sentence detected).
+        Uses existing idle frames at 1.5x speed for a subtle head nod effect.
+        """
+        try:
+            think_idx = self.video_track._idle_index
+            while self._thinking_active and not self.is_speaking:
+                # Advance idle animation at 1.5x speed (skip every 3rd frame)
+                think_idx += 2
+                if self.video_track._idle_frames:
+                    frame = self.video_track._idle_frames[
+                        think_idx % len(self.video_track._idle_frames)
+                    ]
+                    self.video_track._idle_index = think_idx
+                await asyncio.sleep(0.027)  # ~37 FPS = 1.5x normal 25 FPS
+        except (asyncio.CancelledError, Exception):
+            pass
+        finally:
+            self._thinking_active = False
 
     async def _on_realtime_user_transcript(self, text: str):
         """Called when the user's speech is transcribed."""
@@ -3602,20 +3786,450 @@ class ConversationManager:
         # Forward audio directly to the Realtime API
         await self.realtime_session.send_audio(audio_np, sample_rate)
 
-    async def process_response_text(self, response_text):
-        """TTS → Render → WebRTC pipeline for a text response from the Realtime API.
+    async def _run_streaming_pipeline(self):
+        """Streaming pipeline with SYNCED audio and video delivery.
 
-        This replaces the old process_conversation() which also did STT + LLM.
-        Now the Realtime API handles VAD, STT, conversation context, and LLM.
-        We only handle: text → sentence split → TTS → render → stream.
+        Audio and video are pushed in lockstep: each rendered video frame
+        is paired with its corresponding audio samples, ensuring tight
+        lip sync. TTS still runs ahead via pipeline parallelism.
+
+        Architecture (all stages run concurrently via asyncio.gather):
+          sentence_queue (fed live by accumulator as LLM tokens stream in)
+              ↓
+          Stage 1 (tts_worker): sentence → streaming TTS → audio_data_queue
+              ↓
+          Stage 2 (parallel_av_handler): audio_data_queue →
+              └─ prepares WebRTC audio frames + forwards to render_queue
+              ↓
+          Stage 3 (video_renderer): render_queue → IMTalker →
+              ├─ video_track.frame_queue (per frame)
+              └─ audio_track.audio_queue (2 audio frames per video frame)
+
+        Key optimizations:
+        - TTS starts on FIRST sentence while LLM still generates
+        - Sub-sentence streaming: render starts at 1.5s of audio
+        - Audio + video pushed in lockstep for tight lip sync
+        """
+        pipeline_start = self._current_pipeline_start or time.time()
+        print("CM: Starting PARALLEL A/V streaming pipeline")
+
+        pipeline_timings = {
+            "pipeline_start_utc": datetime.now(timezone.utc).isoformat(),
+            "llm_response_time_s": self._current_llm_latency,
+            "response_text": "",
+            "tts_total_time_s": None,
+            "tts_per_sentence": [],
+            "render_total_time_s": None,
+            "render_per_sentence": [],
+            "total_audio_duration_s": 0.0,
+            "first_byte_latency_s": None,
+            "streaming_time_s": None,
+            "total_pipeline_time_s": None,
+            "total_frames": 0,
+            "status": "started",
+            "pipeline_mode": "streaming_token_level",
+        }
+
+        try:
+            self.is_speaking = True
+            self._thinking_active = False  # Stop thinking animation
+
+            # Inter-stage queues for parallel A/V pipeline
+            audio_data_queue = asyncio.Queue(maxsize=8)   # TTS → parallel_av_handler
+            render_queue = asyncio.Queue()                  # parallel_av_handler → video_renderer (unbounded: never block audio delivery)
+
+            SAMPLES_PER_FRAME = 960  # 24000 Hz / 25 FPS
+            MIN_RENDER_DURATION_S = 1.5  # Start rendering with 1.5s of audio (sub-sentence streaming)
+
+            # ── Stage 1: TTS Worker — progressive push: sub-chunks go to queue AS they're ready ──
+            async def tts_worker():
+                tts_total_time = 0
+                chunk_idx = 0
+
+                while True:
+                    sentence = await self._streaming_sentence_queue.get()
+                    if sentence is None:
+                        await audio_data_queue.put(None)
+                        break
+
+                    chunk_idx += 1
+                    t_tts = time.time()
+                    pipeline_timings["response_text"] += (" " if pipeline_timings["response_text"] else "") + sentence
+
+                    _cur_idx = chunk_idx  # capture for closure
+                    _cur_sentence = sentence
+                    _loop = self._loop
+                    _queue = audio_data_queue
+                    _ref_audio = self.reference_audio
+                    _tts_model = self.tts_model
+
+                    def do_tts_progressive():
+                        """Run TTS and push sub-chunks directly to the async queue
+                        via run_coroutine_threadsafe so downstream stages can
+                        start processing (audio delivery + rendering) while TTS
+                        is still generating the rest of the sentence."""
+                        total_samples = 0
+                        sub_chunk_count = 0
+
+                        # Check if text is Nepali and use Sherpa TTS if available
+                        if SHERPA_AVAILABLE and detect_nepali(_cur_sentence) and hasattr(app.state, 'sherpa_tts') and app.state.sherpa_tts is not None:
+                            try:
+                                audio_np = app.state.sherpa_tts.generate(_cur_sentence, sid=5, speed=1.0)
+                                sherpa_sr = app.state.sherpa_tts.sample_rate
+                                if sherpa_sr != 24000:
+                                    import librosa
+                                    audio_np = librosa.resample(audio_np, orig_sr=sherpa_sr, target_sr=24000)
+                                if audio_np is not None:
+                                    chunk = audio_np.flatten().copy()
+                                    fut = asyncio.run_coroutine_threadsafe(
+                                        _queue.put((chunk, _cur_sentence, _cur_idx, True)), _loop
+                                    )
+                                    fut.result(timeout=30)
+                                    return {"total_samples": len(chunk), "sub_chunks": 1}
+                            except Exception as e:
+                                print(f"⚠️  Sherpa TTS failed, falling back: {e}")
+
+                        # STTS streaming with progressive accumulation
+                        tts_stream = _tts_model.generate_stream(
+                            text=_cur_sentence,
+                            chunk_size=10,
+                            print_metrics=False,
+                            audio_prompt_path=_ref_audio,
+                        )
+
+                        accumulated = []
+                        accumulated_samples = 0
+                        sent_first = False
+
+                        for audio_chunk, metrics in tts_stream:
+                            chunk_np = (
+                                audio_chunk.cpu().numpy().flatten()
+                                if isinstance(audio_chunk, torch.Tensor)
+                                else audio_chunk.flatten()
+                            )
+                            accumulated.append(chunk_np)
+                            accumulated_samples += len(chunk_np)
+                            current_duration = accumulated_samples / 24000
+
+                            if not sent_first and current_duration >= MIN_RENDER_DURATION_S:
+                                audio_np = np.concatenate(accumulated)
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    _queue.put((audio_np.copy(), _cur_sentence, _cur_idx, False)), _loop
+                                )
+                                fut.result(timeout=30)
+                                total_samples += len(audio_np)
+                                sub_chunk_count += 1
+                                accumulated = []
+                                accumulated_samples = 0
+                                sent_first = True
+                            elif sent_first and current_duration >= 1.0:
+                                audio_np = np.concatenate(accumulated)
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    _queue.put((audio_np.copy(), _cur_sentence, _cur_idx, False)), _loop
+                                )
+                                fut.result(timeout=30)
+                                total_samples += len(audio_np)
+                                sub_chunk_count += 1
+                                accumulated = []
+                                accumulated_samples = 0
+
+                        if accumulated:
+                            audio_np = np.concatenate(accumulated)
+                            fut = asyncio.run_coroutine_threadsafe(
+                                _queue.put((audio_np.copy(), _cur_sentence, _cur_idx, True)), _loop
+                            )
+                            fut.result(timeout=30)
+                            total_samples += len(audio_np)
+                            sub_chunk_count += 1
+
+                        return {"total_samples": total_samples, "sub_chunks": sub_chunk_count}
+
+                    result = await self._loop.run_in_executor(
+                        self.tts_executor, do_tts_progressive
+                    )
+
+                    tts_time = time.time() - t_tts
+                    tts_total_time += tts_time
+
+                    total_samples = result.get("total_samples", 0) if result else 0
+                    sub_chunks = result.get("sub_chunks", 0) if result else 0
+                    if total_samples > 0:
+                        duration = total_samples / 24000
+                        print(
+                            f"⏱️  TTS sentence {chunk_idx}: {tts_time:.3f}s → {duration:.1f}s audio ({sub_chunks} sub-chunks): '{sentence[:40]}...'"
+                        )
+                        pipeline_timings["tts_per_sentence"].append({
+                            "sentence": sentence,
+                            "tts_time_s": round(tts_time, 3),
+                            "audio_duration_s": round(duration, 3),
+                            "sub_chunks": sub_chunks,
+                        })
+                        pipeline_timings["total_audio_duration_s"] += duration
+                    else:
+                        print(f"⏱️  TTS sentence {chunk_idx}: empty audio, skipping")
+
+                print(f"⏱️  TTS total: {tts_total_time:.3f}s")
+                pipeline_timings["tts_total_time_s"] = round(tts_total_time, 3)
+
+            # ── Stage 2: A/V Sync Handler ──
+            # Prepares audio for browser output and forwards BOTH prepared audio frames
+            # + raw audio to the renderer, which pushes them in lockstep for lip sync.
+            _audio_crossfader = AudioChunkCrossfader(sr=24000, crossfade_ms=15.0)
+            AUDIO_FRAMES_PER_VIDEO = SAMPLES_PER_FRAME // 480  # 960/480 = 2 WebRTC audio frames per video frame
+
+            async def parallel_av_handler():
+                audio_started = False
+
+                while True:
+                    item = await audio_data_queue.get()
+                    if item is None:
+                        await render_queue.put(None)
+                        break
+
+                    audio_24k_np, sentence, chunk_idx, is_final = item
+
+                    if not audio_started:
+                        # First audio chunk — set clock anchor for both tracks
+                        clock = time.time()
+                        self.video_track.start_speaking(clock_anchor=clock)
+                        self.audio_track.reset_clock(clock_anchor=clock)
+                        audio_started = True
+                        latency = clock - pipeline_start
+                        pipeline_timings["first_byte_latency_s"] = round(latency, 3)
+                        print(
+                            f"⏱️  FIRST BYTE: {latency:.3f}s from pipeline start (synced A/V mode)"
+                        )
+
+                    # Prepare audio for browser (crossfade, clip, split into WebRTC frames)
+                    peak = np.abs(audio_24k_np).max()
+                    audio_for_speaker = (
+                        audio_24k_np / peak if peak > 1.0 else audio_24k_np.copy()
+                    )
+                    audio_for_speaker = _audio_crossfader.process(audio_for_speaker)
+                    audio_int16 = (audio_for_speaker * 32767).astype(np.int16)
+                    audio_webrtc_frames = _split_audio_to_webrtc(audio_int16)
+
+                    if self.sync_manager:
+                        self.sync_manager.notify_audio_content(len(audio_int16))
+
+                    # Forward BOTH prepared audio AND raw audio to renderer for lockstep push
+                    await render_queue.put((audio_24k_np, audio_webrtc_frames, sentence, chunk_idx, is_final))
+
+                print(f"⏱️  A/V sync handler: all chunks forwarded to renderer")
+
+            # ── Stage 3: Video Renderer (pushes audio + video in lockstep for lip sync) ──
+            _prev_chunk_last_rgb = [None]
+            BLEND_FRAMES = 2
+
+            async def video_renderer():
+                render_total_time = 0
+                total_frames = 0
+
+                while True:
+                    item = await render_queue.get()
+                    if item is None:
+                        break
+
+                    audio_24k_np, audio_webrtc_frames, sentence, chunk_idx, is_final = item
+                    total_audio_samples = len(audio_24k_np)
+
+                    print(f"CM: Rendering chunk {chunk_idx}: '{sentence[:30]}...' ({total_audio_samples/24000:.1f}s)")
+                    t_render = time.time()
+
+                    def render_and_push_av():
+                        """Render video frames and push audio + video in lockstep for lip sync."""
+                        gpu_monitor.check_and_log(f"render-sync-{chunk_idx}")
+
+                        # Resample 24kHz → 16kHz for wav2vec2
+                        if _HAS_TORCHAUDIO:
+                            at = torch.from_numpy(audio_24k_np).float().unsqueeze(0)
+                            audio_16k = AF.resample(at, 24000, 16000).squeeze(0).numpy()
+                            del at
+                        else:
+                            num_samples_16k = int(len(audio_24k_np) * 16000 / 24000)
+                            from scipy.signal import resample as scipy_resample
+                            audio_16k = scipy_resample(
+                                audio_24k_np, num_samples_16k
+                            ).astype(np.float32)
+
+                        expected_frames = (
+                            total_audio_samples + SAMPLES_PER_FRAME - 1
+                        ) // SAMPLES_PER_FRAME
+
+                        frame_count = 0
+                        audio_frame_idx = 0
+                        last_rgb = None
+
+                        for video_frames, metrics in self.imtalker_streamer.generate_stream(
+                            self.avatar_img, iter([audio_16k])
+                        ):
+                            for ft in video_frames:
+                                if frame_count >= expected_frames:
+                                    del ft
+                                    continue
+
+                                frame_rgb = process_frame_tensor(ft, format="RGB")
+
+                                if (
+                                    _prev_chunk_last_rgb[0] is not None
+                                    and frame_count < BLEND_FRAMES
+                                ):
+                                    alpha = (frame_count + 1) / (BLEND_FRAMES + 1)
+                                    prev = _prev_chunk_last_rgb[0].astype(np.float32)
+                                    curr = frame_rgb.astype(np.float32)
+                                    frame_rgb = (
+                                        (1 - alpha) * prev + alpha * curr
+                                    ).astype(np.uint8)
+
+                                last_rgb = frame_rgb.copy()
+                                output_rgb = self.paste_back_frame(frame_rgb)
+                                av_frame = VideoFrame.from_ndarray(output_rgb, format="rgb24")
+                                del ft, frame_rgb, output_rgb
+
+                                # Push video frame to video track
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    self.video_track.frame_queue.put(av_frame), self._loop
+                                )
+                                fut.result(timeout=10)
+
+                                # Push corresponding audio frames in lockstep
+                                for _ in range(AUDIO_FRAMES_PER_VIDEO):
+                                    if audio_frame_idx < len(audio_webrtc_frames):
+                                        afut = asyncio.run_coroutine_threadsafe(
+                                            self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                            self._loop
+                                        )
+                                        afut.result(timeout=10)
+                                        audio_frame_idx += 1
+
+                                frame_count += 1
+                            del video_frames
+
+                        # Pad remaining frames if needed
+                        if frame_count > 0 and frame_count < expected_frames:
+                            last_frame = VideoFrame.from_ndarray(
+                                self.paste_back_frame(last_rgb) if last_rgb is not None
+                                else np.zeros((512, 512, 3), dtype=np.uint8),
+                                format="rgb24"
+                            )
+                            while frame_count < expected_frames:
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    self.video_track.frame_queue.put(last_frame),
+                                    self._loop,
+                                )
+                                fut.result(timeout=10)
+                                for _ in range(AUDIO_FRAMES_PER_VIDEO):
+                                    if audio_frame_idx < len(audio_webrtc_frames):
+                                        afut = asyncio.run_coroutine_threadsafe(
+                                            self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                            self._loop
+                                        )
+                                        afut.result(timeout=10)
+                                        audio_frame_idx += 1
+                                frame_count += 1
+
+                        # Push any remaining audio frames
+                        while audio_frame_idx < len(audio_webrtc_frames):
+                            afut = asyncio.run_coroutine_threadsafe(
+                                self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                self._loop
+                            )
+                            afut.result(timeout=10)
+                            audio_frame_idx += 1
+
+                        del audio_16k
+                        _prev_chunk_last_rgb[0] = last_rgb
+
+                        if self.sync_manager:
+                            self.sync_manager.notify_video_content(frame_count)
+
+                        return frame_count
+
+                    frame_count = await self._loop.run_in_executor(
+                        None, render_and_push_av
+                    )
+                    render_time = time.time() - t_render
+                    render_total_time += render_time
+                    total_frames += frame_count
+                    del audio_24k_np
+
+                    self.last_chunk_final_frame = None  # Updated via frame_queue
+
+                    pipeline_timings["render_per_sentence"].append({
+                        "sentence": sentence,
+                        "render_time_s": round(render_time, 3),
+                        "frame_count": frame_count,
+                    })
+                    print(
+                        f"⏱️  Render chunk {chunk_idx}: {render_time:.3f}s → {frame_count} video frames"
+                    )
+
+                # All A/V frames delivered — signal completion
+                self.audio_track.stop_expecting()
+                self.video_track.mark_speech_ending()
+
+                # Wait for video playback to finish (frames drain from queue)
+                if total_frames > 0:
+                    total_duration = total_frames * 0.04  # 40ms per frame at 25 FPS
+                    elapsed_so_far = time.time() - pipeline_start
+                    remaining = total_duration - elapsed_so_far + 0.08
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+
+                self.video_track.stop_speaking()
+
+                print(f"⏱️  Render total: {render_total_time:.3f}s → {total_frames} frames")
+                pipeline_timings["render_total_time_s"] = round(render_total_time, 3)
+                pipeline_timings["total_frames"] = total_frames
+
+                total_pipeline_time = time.time() - pipeline_start
+                pipeline_timings["streaming_time_s"] = round(total_pipeline_time, 3)
+                pipeline_timings["total_pipeline_time_s"] = round(total_pipeline_time, 3)
+                print(f"⏱️  TOTAL PIPELINE (synced A/V): {total_pipeline_time:.3f}s")
+
+            # Run all stages concurrently — TTS runs ahead, but A/V pushed in lockstep
+            await asyncio.gather(tts_worker(), parallel_av_handler(), video_renderer())
+            pipeline_timings["status"] = "completed"
+
+        except asyncio.CancelledError:
+            print("CM: Streaming pipeline cancelled (barge-in)")
+            pipeline_timings["status"] = "cancelled"
+            pipeline_timings["total_pipeline_time_s"] = round(time.time() - pipeline_start, 3)
+        except Exception as e:
+            print(f"CM Streaming Pipeline Error: {e}")
+            traceback.print_exc()
+            pipeline_timings["status"] = "error"
+            pipeline_timings["error"] = str(e)
+            pipeline_timings["total_pipeline_time_s"] = round(time.time() - pipeline_start, 3)
+        finally:
+            self.is_speaking = False
+            pipeline_timings["total_audio_duration_s"] = round(pipeline_timings.get("total_audio_duration_s", 0), 3)
+            logger.info(f"Streaming pipeline timings: {json.dumps(pipeline_timings, default=str)[:800]}")
+            _update_last_oshara_log_timings(app, pipeline_timings, session_id=self.webrtc_session_id)
+            # Drain any leftover items in the sentence queue (e.g., after cancellation)
+            while not self._streaming_sentence_queue.empty():
+                try:
+                    self._streaming_sentence_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+    async def process_response_text(self, response_text):
+        """TTS → synced A/V → WebRTC pipeline for a text response.
+
+        Audio and video are pushed in lockstep: each rendered video frame
+        is paired with its corresponding audio samples for lip sync.
+        TTS still runs ahead via pipeline parallelism.
 
         Architecture (all stages run concurrently):
-          Stage 1 (sentence_feeder): Split text into sentences, feed to TTS
-          Stage 2 (tts_worker): sentence → audio numpy → pushes to audio_queue
-          Stage 3 (renderer): audio numpy → paired (VideoFrame, audio_int16) → av_queue
-          Stage 4 (av_streamer): pushes paired A/V to WebRTC tracks
+          Stage 1 (sentence_feeder): Split text into sentences
+          Stage 2 (tts_worker): sentence → audio numpy → audio_data_queue
+          Stage 3 (parallel_av_handler): audio_data_queue →
+              └─ prepares WebRTC audio frames + forwards to render_queue
+          Stage 4 (video_renderer): render_queue → IMTalker →
+              ├─ video_track (per frame)
+              └─ audio_track (2 audio frames per video frame)
         """
-        print(f"CM: Processing response text: '{response_text[:80]}...'")
+        print(f"CM: Processing response text (parallel A/V): '{response_text[:80]}...'")
         pipeline_start = time.time()
 
         # Shared timing dict — populated by each pipeline stage
@@ -3638,17 +4252,15 @@ class ConversationManager:
         try:
             self.is_speaking = True
 
-            # Queues connecting the pipeline stages
-            sentence_queue = asyncio.Queue(maxsize=4)  # Sentences → TTS
-            audio_queue = asyncio.Queue(maxsize=2)  # TTS audio → Renderer
-            av_queue = asyncio.Queue(maxsize=30)  # Rendered A/V pairs → WebRTC
+            # Queues for parallel A/V pipeline
+            sentence_queue = asyncio.Queue(maxsize=6)      # Sentences → TTS
+            audio_data_queue = asyncio.Queue(maxsize=8)    # TTS → parallel_av_handler
+            render_queue = asyncio.Queue()                  # parallel_av_handler → video_renderer (unbounded: never block audio delivery)
 
             SAMPLES_PER_FRAME = 960  # 24000 Hz / 25 FPS
 
             # ── Stage 1: Sentence Splitter ──
-            # Splits the response text into sentences for streaming TTS.
             async def sentence_feeder():
-                # Split on sentence boundaries
                 sentence_end_pattern = re.compile(r"[.!?](?:\s|$)")
                 buffer = response_text
                 sentence_count = 0
@@ -3663,7 +4275,6 @@ class ConversationManager:
                             await sentence_queue.put(sentence)
                         buffer = buffer[end_pos:].lstrip()
                     else:
-                        # No more sentence boundaries — yield remaining
                         remaining = buffer.strip()
                         if remaining:
                             sentence_count += 1
@@ -3683,32 +4294,25 @@ class ConversationManager:
                 while True:
                     sentence = await sentence_queue.get()
                     if sentence is None:
-                        await audio_queue.put(None)
+                        await audio_data_queue.put(None)
                         break
 
                     chunk_idx += 1
                     t_tts = time.time()
 
                     def do_tts(text):
-                        # Check if text is Nepali and use Sherpa TTS if available
                         if SHERPA_AVAILABLE and detect_nepali(text) and hasattr(app.state, 'sherpa_tts') and app.state.sherpa_tts is not None:
                             print(f"🇳🇵 Using Sherpa TTS for Nepali text: '{text[:50]}...'")
                             try:
-                                # Generate audio using Sherpa TTS
                                 audio_np = app.state.sherpa_tts.generate(text, sid=5, speed=1.0)
                                 sherpa_sr = app.state.sherpa_tts.sample_rate
-                                
-                                # Resample to 24kHz if needed
                                 if sherpa_sr != 24000:
                                     import librosa
                                     audio_np = librosa.resample(audio_np, orig_sr=sherpa_sr, target_sr=24000)
-                                
                                 return audio_np.flatten().copy() if audio_np is not None else None
                             except Exception as e:
                                 print(f"⚠️  Sherpa TTS failed for Nepali, falling back to STTS: {e}")
-                                # Fall through to use STTS
-                        
-                        # Use STTS for non-Nepali or as fallback
+
                         tts_stream = self.tts_model.generate_stream(
                             text=text,
                             chunk_size=15,
@@ -3744,38 +4348,80 @@ class ConversationManager:
                             "audio_duration_s": round(duration, 3),
                         })
                         pipeline_timings["total_audio_duration_s"] += duration
-                        await audio_queue.put((audio_24k_np, sentence, chunk_idx))
+                        await audio_data_queue.put((audio_24k_np, sentence, chunk_idx))
                     else:
                         print(f"⏱️  TTS sentence {chunk_idx}: empty audio, skipping")
 
                 print(f"⏱️  TTS total: {tts_total_time:.3f}s")
                 pipeline_timings["tts_total_time_s"] = round(tts_total_time, 3)
 
-            # ── Stage 3: Renderer ──
-            # Takes audio from audio_queue, renders video, pushes A/V pairs to av_queue.
-            _prev_chunk_last_rgb = [None]
+            # ── Stage 3: A/V Sync Handler ──
+            # Prepares audio for browser output and forwards BOTH prepared audio frames
+            # + raw audio to the renderer, which pushes them in lockstep for lip sync.
             _audio_crossfader = AudioChunkCrossfader(sr=24000, crossfade_ms=15.0)
-            BLEND_FRAMES = 2
+            AUDIO_FRAMES_PER_VIDEO = SAMPLES_PER_FRAME // 480  # 960/480 = 2
 
-            async def renderer():
-                render_total_time = 0
+            async def parallel_av_handler():
+                audio_started = False
 
                 while True:
-                    item = await audio_queue.get()
+                    item = await audio_data_queue.get()
                     if item is None:
-                        await av_queue.put(None)
+                        await render_queue.put(None)
                         break
 
                     audio_24k_np, sentence, chunk_idx = item
+
+                    if not audio_started:
+                        clock = time.time()
+                        self.video_track.start_speaking(clock_anchor=clock)
+                        self.audio_track.reset_clock(clock_anchor=clock)
+                        audio_started = True
+                        latency = clock - pipeline_start
+                        pipeline_timings["first_byte_latency_s"] = round(latency, 3)
+                        print(
+                            f"⏱️  FIRST BYTE: {latency:.3f}s from pipeline start (synced A/V mode)"
+                        )
+
+                    # Prepare audio for browser (crossfade, clip, split into WebRTC frames)
+                    peak = np.abs(audio_24k_np).max()
+                    audio_for_speaker = (
+                        audio_24k_np / peak if peak > 1.0 else audio_24k_np.copy()
+                    )
+                    audio_for_speaker = _audio_crossfader.process(audio_for_speaker)
+                    audio_int16 = (audio_for_speaker * 32767).astype(np.int16)
+                    audio_webrtc_frames = _split_audio_to_webrtc(audio_int16)
+
+                    if self.sync_manager:
+                        self.sync_manager.notify_audio_content(len(audio_int16))
+
+                    # Forward BOTH prepared audio AND raw audio to renderer for lockstep push
+                    await render_queue.put((audio_24k_np, audio_webrtc_frames, sentence, chunk_idx))
+
+                print(f"⏱️  A/V sync handler: all chunks forwarded to renderer")
+
+            # ── Stage 4: Video Renderer (pushes audio + video in lockstep for lip sync) ──
+            _prev_chunk_last_rgb = [None]
+            BLEND_FRAMES = 2
+
+            async def video_renderer():
+                render_total_time = 0
+                total_frames = 0
+
+                while True:
+                    item = await render_queue.get()
+                    if item is None:
+                        break
+
+                    audio_24k_np, audio_webrtc_frames, sentence, chunk_idx = item
                     total_audio_samples = len(audio_24k_np)
 
                     print(f"CM: Rendering sentence {chunk_idx}: '{sentence[:40]}...'")
                     t_render = time.time()
 
-                    def render_and_stream():
-                        gpu_monitor.check_and_log(f"render-sentence-{chunk_idx}")
+                    def render_and_push_av():
+                        gpu_monitor.check_and_log(f"render-sync-{chunk_idx}")
 
-                        # Resample 24kHz → 16kHz for wav2vec2
                         if _HAS_TORCHAUDIO:
                             at = torch.from_numpy(audio_24k_np).float().unsqueeze(0)
                             audio_16k = AF.resample(at, 24000, 16000).squeeze(0).numpy()
@@ -3783,32 +4429,19 @@ class ConversationManager:
                         else:
                             num_samples_16k = int(len(audio_24k_np) * 16000 / 24000)
                             from scipy.signal import resample as scipy_resample
-
                             audio_16k = scipy_resample(
                                 audio_24k_np, num_samples_16k
                             ).astype(np.float32)
-
-                        # Clip audio to [-1, 1] to prevent int16 overflow
-                        peak = np.abs(audio_24k_np).max()
-                        audio_24k_clipped = (
-                            audio_24k_np / peak if peak > 1.0 else audio_24k_np.copy()
-                        )
-                        # Inter-chunk crossfade + DC removal to prevent clicks at boundaries
-                        audio_24k_clipped = _audio_crossfader.process(audio_24k_clipped)
 
                         expected_frames = (
                             total_audio_samples + SAMPLES_PER_FRAME - 1
                         ) // SAMPLES_PER_FRAME
 
                         frame_count = 0
-                        audio_cursor = 0
+                        audio_frame_idx = 0
                         last_rgb = None
-                        last_av_frame = None
 
-                        for (
-                            video_frames,
-                            metrics,
-                        ) in self.imtalker_streamer.generate_stream(
+                        for video_frames, metrics in self.imtalker_streamer.generate_stream(
                             self.avatar_img, iter([audio_16k])
                         ):
                             for ft in video_frames:
@@ -3830,72 +4463,74 @@ class ConversationManager:
                                     ).astype(np.uint8)
 
                                 last_rgb = frame_rgb.copy()
-                                # Crop-Infer-Paste: composite face into full image
                                 output_rgb = self.paste_back_frame(frame_rgb)
-                                av_frame = VideoFrame.from_ndarray(
-                                    output_rgb, format="rgb24"
-                                )
-                                last_av_frame = av_frame
+                                av_frame = VideoFrame.from_ndarray(output_rgb, format="rgb24")
                                 del ft, frame_rgb, output_rgb
 
-                                audio_slice = np.zeros(
-                                    SAMPLES_PER_FRAME, dtype=np.float32
-                                )
-                                avail = min(
-                                    SAMPLES_PER_FRAME,
-                                    total_audio_samples - audio_cursor,
-                                )
-                                if avail > 0:
-                                    audio_slice[:avail] = audio_24k_clipped[
-                                        audio_cursor : audio_cursor + avail
-                                    ]
-                                audio_cursor += SAMPLES_PER_FRAME
-                                audio_slice_int16 = (audio_slice * 32767).astype(
-                                    np.int16
-                                )
-
-                                pair = (av_frame, audio_slice_int16)
+                                # Push video frame to video track
                                 fut = asyncio.run_coroutine_threadsafe(
-                                    av_queue.put(pair), self._loop
+                                    self.video_track.frame_queue.put(av_frame), self._loop
                                 )
                                 fut.result(timeout=10)
+
+                                # Push corresponding audio frames in lockstep
+                                for _ in range(AUDIO_FRAMES_PER_VIDEO):
+                                    if audio_frame_idx < len(audio_webrtc_frames):
+                                        afut = asyncio.run_coroutine_threadsafe(
+                                            self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                            self._loop
+                                        )
+                                        afut.result(timeout=10)
+                                        audio_frame_idx += 1
+
                                 frame_count += 1
                             del video_frames
 
-                        while (
-                            frame_count < expected_frames and last_av_frame is not None
-                        ):
-                            audio_slice = np.zeros(SAMPLES_PER_FRAME, dtype=np.float32)
-                            avail = min(
-                                SAMPLES_PER_FRAME, total_audio_samples - audio_cursor
+                        if frame_count > 0 and frame_count < expected_frames:
+                            last_frame = VideoFrame.from_ndarray(
+                                self.paste_back_frame(last_rgb) if last_rgb is not None
+                                else np.zeros((512, 512, 3), dtype=np.uint8),
+                                format="rgb24"
                             )
-                            if avail > 0:
-                                audio_slice[:avail] = audio_24k_clipped[
-                                    audio_cursor : audio_cursor + avail
-                                ]
-                            audio_cursor += SAMPLES_PER_FRAME
-                            audio_slice_int16 = (audio_slice * 32767).astype(np.int16)
-                            fut = asyncio.run_coroutine_threadsafe(
-                                av_queue.put((last_av_frame, audio_slice_int16)),
-                                self._loop,
-                            )
-                            fut.result(timeout=10)
-                            frame_count += 1
+                            while frame_count < expected_frames:
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    self.video_track.frame_queue.put(last_frame),
+                                    self._loop,
+                                )
+                                fut.result(timeout=10)
+                                for _ in range(AUDIO_FRAMES_PER_VIDEO):
+                                    if audio_frame_idx < len(audio_webrtc_frames):
+                                        afut = asyncio.run_coroutine_threadsafe(
+                                            self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                            self._loop
+                                        )
+                                        afut.result(timeout=10)
+                                        audio_frame_idx += 1
+                                frame_count += 1
 
-                        if frame_count != expected_frames:
-                            print(
-                                f"⚠️  SYNC: sentence {chunk_idx} expected {expected_frames} frames, got {frame_count}"
+                        # Push any remaining audio frames
+                        while audio_frame_idx < len(audio_webrtc_frames):
+                            afut = asyncio.run_coroutine_threadsafe(
+                                self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                self._loop
                             )
+                            afut.result(timeout=10)
+                            audio_frame_idx += 1
 
-                        del audio_16k, audio_24k_clipped
+                        del audio_16k
                         _prev_chunk_last_rgb[0] = last_rgb
+
+                        if self.sync_manager:
+                            self.sync_manager.notify_video_content(frame_count)
+
                         return frame_count
 
                     frame_count = await self._loop.run_in_executor(
-                        None, render_and_stream
+                        None, render_and_push_av
                     )
                     render_time = time.time() - t_render
                     render_total_time += render_time
+                    total_frames += frame_count
                     del audio_24k_np
 
                     pipeline_timings["render_per_sentence"].append({
@@ -3904,101 +4539,34 @@ class ConversationManager:
                         "frame_count": frame_count,
                     })
                     print(
-                        f"⏱️  Render sentence {chunk_idx}: {render_time:.3f}s → {frame_count} A/V pairs"
+                        f"⏱️  Render sentence {chunk_idx}: {render_time:.3f}s → {frame_count} video frames"
                     )
 
-                print(f"⏱️  Render total: {render_total_time:.3f}s")
-                pipeline_timings["render_total_time_s"] = round(render_total_time, 3)
-
-            # ── Stage 4: A/V Streamer ──
-            PRE_BUFFER_FRAMES = 1  # OPTIMIZED: Reduced from 3→1 for faster first-byte-time (-80ms)
-
-            async def av_streamer():
-                total_frames = 0
-                stream_start = None
-                pre_buffer = []
-                started = False
-
-                while True:
-                    item = await av_queue.get()
-                    if item is None:
-                        if not started and pre_buffer:
-                            clock = time.time()
-                            self.video_track.start_speaking(clock_anchor=clock)
-                            self.audio_track.reset_clock(clock_anchor=clock)
-                            for pf, pa in pre_buffer:
-                                audio_chunks = _split_audio_to_webrtc(pa)
-                                await self.video_track.frame_queue.put(pf)
-                                for chunk in audio_chunks:
-                                    await self.audio_track.audio_queue.put(chunk)
-                                total_frames += 1
-                            stream_start = clock
-                            started = True
-                            pre_buffer = None
-                        break
-
-                    av_frame, audio_slice_int16 = item
-
-                    if not started:
-                        pre_buffer.append((av_frame, audio_slice_int16))
-                        if len(pre_buffer) >= PRE_BUFFER_FRAMES:
-                            clock = time.time()
-                            self.video_track.start_speaking(clock_anchor=clock)
-                            self.audio_track.reset_clock(clock_anchor=clock)
-                            for pf, pa in pre_buffer:
-                                audio_chunks = _split_audio_to_webrtc(pa)
-                                await self.video_track.frame_queue.put(pf)
-                                for chunk in audio_chunks:
-                                    await self.audio_track.audio_queue.put(chunk)
-                                total_frames += 1
-                            stream_start = clock
-                            started = True
-                            pre_buffer = None
-                            latency = clock - pipeline_start
-                            pipeline_timings["first_byte_latency_s"] = round(latency, 3)
-                            print(
-                                f"⏱️  FIRST A/V PAIR: {latency:.3f}s from pipeline start ({PRE_BUFFER_FRAMES} pre-buffered)"
-                            )
-                        continue
-
-                    audio_chunks = _split_audio_to_webrtc(audio_slice_int16)
-                    await self.video_track.frame_queue.put(av_frame)
-                    for chunk in audio_chunks:
-                        await self.audio_track.audio_queue.put(chunk)
-
-                    total_frames += 1
-                    self.last_chunk_final_frame = av_frame
-
-                    if self.sync_manager:
-                        self.sync_manager.notify_video_content(1)
-                        self.sync_manager.notify_audio_content(len(audio_slice_int16))
-
+                # All A/V frames delivered — signal completion
+                self.audio_track.stop_expecting()
                 self.video_track.mark_speech_ending()
 
-                if stream_start and total_frames > 0:
+                if total_frames > 0:
                     total_duration = total_frames * 0.04
-                    elapsed_so_far = time.time() - stream_start
+                    elapsed_so_far = time.time() - pipeline_start
                     remaining = total_duration - elapsed_so_far + 0.08
                     if remaining > 0:
                         await asyncio.sleep(remaining)
 
-                self.audio_track.stop_expecting()
                 self.video_track.stop_speaking()
 
-                elapsed = time.time() - stream_start if stream_start else 0
-                fps_actual = total_frames / elapsed if elapsed > 0 else 0
-                print(
-                    f"⏱️  Streamed {total_frames} A/V pairs in {elapsed:.2f}s ({fps_actual:.1f} FPS)"
-                )
-                total_pipeline_time = time.time() - pipeline_start
-                print(f"⏱️  TOTAL PIPELINE: {total_pipeline_time:.3f}s")
-                pipeline_timings["streaming_time_s"] = round(elapsed, 3)
-                pipeline_timings["total_pipeline_time_s"] = round(total_pipeline_time, 3)
+                print(f"⏱️  Render total: {render_total_time:.3f}s → {total_frames} frames")
+                pipeline_timings["render_total_time_s"] = round(render_total_time, 3)
                 pipeline_timings["total_frames"] = total_frames
 
-            # Run ALL stages concurrently
+                total_pipeline_time = time.time() - pipeline_start
+                pipeline_timings["streaming_time_s"] = round(total_pipeline_time, 3)
+                pipeline_timings["total_pipeline_time_s"] = round(total_pipeline_time, 3)
+                print(f"⏱️  TOTAL PIPELINE (synced A/V): {total_pipeline_time:.3f}s")
+
+            # Run ALL stages concurrently — TTS runs ahead, but A/V pushed in lockstep
             await asyncio.gather(
-                sentence_feeder(), tts_worker(), renderer(), av_streamer()
+                sentence_feeder(), tts_worker(), parallel_av_handler(), video_renderer()
             )
 
             pipeline_timings["status"] = "completed"
@@ -4022,17 +4590,18 @@ class ConversationManager:
             _update_last_oshara_log_timings(app, pipeline_timings, session_id=self.webrtc_session_id)
 
     async def generate_and_feed(self, text):
-        """Real-time streaming pipeline with LOCKED audio-video synchronization.
+        """Real-time streaming pipeline with SYNCED audio and video delivery.
 
         Architecture:
-          Stage 1 (audio_chunker): TTS text → audio tensors (CPU)
-          Stage 2 (renderer): audio → paired (video_frame, audio_slice) items
-          Stage 3 (av_streamer): pushes paired A/V to WebRTC tracks in LOCKSTEP
+          Stage 1 (audio_chunker): TTS text → audio tensors → audio_data_queue
+          Stage 2 (parallel_av_handler): audio_data_queue →
+              └→ prepares WebRTC audio frames + forwards to render_queue
+          Stage 3 (video_renderer): render_queue → IMTalker →
+              ├→ video_track (per frame)
+              └→ audio_track (2 audio frames per video frame, lockstep)
 
-        The key insight: audio and video are NEVER pushed separately.
-        Each item in av_queue is (video_frame, audio_samples_for_that_frame).
-        av_streamer pushes both to their tracks at the SAME wall-clock instant,
-        so WebRTC timestamps stay aligned regardless of rendering speed.
+        Audio + video are pushed in lockstep for tight lip sync.
+        TTS runs ahead via pipeline parallelism.
         """
         print(f"CM: Generating response: {text[:50]}{'...' if len(text) > 50 else ''}")
         self.is_speaking = True
@@ -4061,44 +4630,67 @@ class ConversationManager:
             "status": "started",
         }
 
-        # TTS output queue
-        audio_chunks_queue = asyncio.Queue(maxsize=2)
-        # PAIRED A/V queue: each item is (VideoFrame, np.ndarray_audio_int16_slice) or None
-        av_queue = asyncio.Queue(maxsize=30)
+        # TTS output → parallel handler
+        audio_data_queue = asyncio.Queue(maxsize=8)
+        # parallel handler → video renderer (unbounded: never block audio delivery)
+        render_queue = asyncio.Queue()
 
         SAMPLES_PER_FRAME = 960  # 24000 Hz / 25 FPS = 960 audio samples per video frame
 
         try:
-            # Stage 1: TTS — generate audio for each text chunk
+            # Stage 1: TTS — generate audio for each text chunk (in executor to not block event loop)
             async def audio_chunker():
                 tts_total_time = 0
                 for chunk_idx, text_chunk in enumerate(text_chunks, 1):
                     t_tts = time.time()
-                    tts_stream = self.tts_model.generate_stream(
-                        text=text_chunk,
-                        chunk_size=15,  # Smaller chunks for faster first byte
-                        print_metrics=False,
-                        audio_prompt_path=self.reference_audio,
-                    )
-                    audio_parts = []
-                    for audio_chunk, metrics in tts_stream:
-                        audio_parts.append(
-                            audio_chunk.cpu()
-                            if isinstance(audio_chunk, torch.Tensor)
-                            else audio_chunk
+
+                    _text = text_chunk
+                    _ref_audio = self.reference_audio
+                    _tts_model = self.tts_model
+
+                    def do_tts():
+                        if SHERPA_AVAILABLE and detect_nepali(_text) and hasattr(app.state, 'sherpa_tts') and app.state.sherpa_tts is not None:
+                            try:
+                                audio_np = app.state.sherpa_tts.generate(_text, sid=5, speed=1.0)
+                                sherpa_sr = app.state.sherpa_tts.sample_rate
+                                if sherpa_sr != 24000:
+                                    import librosa
+                                    audio_np = librosa.resample(audio_np, orig_sr=sherpa_sr, target_sr=24000)
+                                return audio_np.flatten().copy() if audio_np is not None else None
+                            except Exception as e:
+                                print(f"⚠️  Sherpa TTS failed, falling back: {e}")
+
+                        tts_stream = _tts_model.generate_stream(
+                            text=_text,
+                            chunk_size=15,
+                            print_metrics=False,
+                            audio_prompt_path=_ref_audio,
                         )
+                        audio_parts = []
+                        for audio_chunk, metrics in tts_stream:
+                            audio_parts.append(
+                                audio_chunk.cpu()
+                                if isinstance(audio_chunk, torch.Tensor)
+                                else audio_chunk
+                            )
+                        if audio_parts:
+                            full_audio = torch.cat(audio_parts, dim=-1)
+                            audio_np = full_audio.numpy().flatten().copy()
+                            del full_audio, audio_parts
+                            return audio_np
+                        del audio_parts
+                        return None
+
+                    audio_np = await self._loop.run_in_executor(
+                        self.tts_executor, do_tts
+                    )
 
                     tts_chunk_time = time.time() - t_tts
                     tts_total_time += tts_chunk_time
 
-                    if audio_parts:
-                        full_audio = torch.cat(audio_parts, dim=-1)
-                        del audio_parts
-                        # Convert to numpy immediately to free torch allocator
-                        audio_np = full_audio.numpy().flatten().copy()
+                    if audio_np is not None and len(audio_np) > 0:
                         duration = len(audio_np) / 24000
-                        del full_audio
-                        await audio_chunks_queue.put((audio_np, text_chunk, chunk_idx))
+                        await audio_data_queue.put((audio_np, text_chunk, chunk_idx))
                         print(
                             f"⏱️  TTS chunk {chunk_idx}/{len(text_chunks)}: {tts_chunk_time:.3f}s → {duration:.1f}s audio"
                         )
@@ -4108,33 +4700,70 @@ class ConversationManager:
                             "audio_duration_s": round(duration, 3),
                         })
                         pipeline_timings["total_audio_duration_s"] += duration
-                    else:
-                        del audio_parts
 
-                await audio_chunks_queue.put(None)
+                await audio_data_queue.put(None)
                 print(
                     f"⏱️  TTS total: {tts_total_time:.3f}s for {len(text_chunks)} chunks"
                 )
                 pipeline_timings["tts_total_time_s"] = round(tts_total_time, 3)
 
-            # Stage 2: Render → stream paired (frame, audio_slice) into av_queue
-            # Includes inter-chunk frame blending for smooth transitions between text chunks
-            _prev_chunk_last_rgb_feed = [
-                None
-            ]  # Shared mutable for cross-chunk blending
+            # Stage 2: A/V Sync Handler — prepares audio, forwards to renderer for lockstep push
             _audio_crossfader_feed = AudioChunkCrossfader(sr=24000, crossfade_ms=15.0)
-            BLEND_FRAMES_FEED = 2  # Blend first 2 frames of each chunk
+            AUDIO_FRAMES_PER_VIDEO_FEED = SAMPLES_PER_FRAME // 480  # 960/480 = 2
 
-            async def renderer():
-                render_total_time = 0
+            async def parallel_av_handler():
+                audio_started = False
 
                 while True:
-                    item = await audio_chunks_queue.get()
+                    item = await audio_data_queue.get()
                     if item is None:
-                        await av_queue.put(None)
+                        await render_queue.put(None)
                         break
 
                     audio_24k_np, text_chunk, chunk_idx = item
+
+                    if not audio_started:
+                        clock = time.time()
+                        self.video_track.start_speaking(clock_anchor=clock)
+                        self.audio_track.reset_clock(clock_anchor=clock)
+                        audio_started = True
+                        latency = clock - pipeline_start
+                        pipeline_timings["first_byte_latency_s"] = round(latency, 3)
+                        print(
+                            f"⏱️  FIRST BYTE: {latency:.3f}s from pipeline start (synced A/V mode)"
+                        )
+
+                    # Prepare audio for browser (crossfade, clip, split into WebRTC frames)
+                    peak = np.abs(audio_24k_np).max()
+                    audio_for_speaker = (
+                        audio_24k_np / peak if peak > 1.0 else audio_24k_np.copy()
+                    )
+                    audio_for_speaker = _audio_crossfader_feed.process(audio_for_speaker)
+                    audio_int16 = (audio_for_speaker * 32767).astype(np.int16)
+                    audio_webrtc_frames = _split_audio_to_webrtc(audio_int16)
+
+                    if self.sync_manager:
+                        self.sync_manager.notify_audio_content(len(audio_int16))
+
+                    # Forward BOTH prepared audio AND raw audio to renderer for lockstep push
+                    await render_queue.put((audio_24k_np, audio_webrtc_frames, text_chunk, chunk_idx))
+
+                print(f"⏱️  A/V sync handler: all chunks forwarded to renderer")
+
+            # Stage 3: Video Renderer (pushes audio + video in lockstep for lip sync)
+            _prev_chunk_last_rgb_feed = [None]
+            BLEND_FRAMES_FEED = 2
+
+            async def video_renderer():
+                render_total_time = 0
+                total_frames = 0
+
+                while True:
+                    item = await render_queue.get()
+                    if item is None:
+                        break
+
+                    audio_24k_np, audio_webrtc_frames, text_chunk, chunk_idx = item
                     total_audio_samples = len(audio_24k_np)
                     chunk_duration = total_audio_samples / 24000
 
@@ -4143,15 +4772,9 @@ class ConversationManager:
                     )
                     t_render = time.time()
 
-                    def render_and_stream():
-                        """Render video and push pairs DIRECTLY to av_queue as they're generated.
+                    def render_and_push_av():
+                        gpu_monitor.check_and_log(f"render-sync-feed-{chunk_idx}")
 
-                        No accumulation — each pair is pushed immediately, keeping peak
-                        memory usage to ~1 batch of frames instead of ALL frames.
-                        """
-                        gpu_monitor.check_and_log(f"render-chunk-{chunk_idx}")
-
-                        # Resample 24kHz → 16kHz for wav2vec2 (entirely numpy, no torch tensor needed)
                         if _HAS_TORCHAUDIO:
                             at = torch.from_numpy(audio_24k_np).float().unsqueeze(0)
                             audio_16k = AF.resample(at, 24000, 16000).squeeze(0).numpy()
@@ -4159,134 +4782,112 @@ class ConversationManager:
                         else:
                             num_samples_16k = int(len(audio_24k_np) * 16000 / 24000)
                             from scipy.signal import resample as scipy_resample
-
                             audio_16k = scipy_resample(
                                 audio_24k_np, num_samples_16k
                             ).astype(np.float32)
 
-                        # Clip audio to [-1, 1] to prevent int16 overflow distortion
-                        peak = np.abs(audio_24k_np).max()
-                        audio_24k_clipped = (
-                            audio_24k_np / peak if peak > 1.0 else audio_24k_np.copy()
-                        )
-                        # Inter-chunk crossfade + DC removal to prevent clicks at boundaries
-                        audio_24k_clipped = _audio_crossfader_feed.process(audio_24k_clipped)
-
-                        # ── Lip Sync: force exact frame-to-audio alignment ──
                         expected_frames = (
                             total_audio_samples + SAMPLES_PER_FRAME - 1
                         ) // SAMPLES_PER_FRAME
 
                         frame_count = 0
-                        audio_cursor = 0
-                        last_rgb = None  # Track last RGB for cross-chunk blending
-                        last_av_frame = None
+                        audio_frame_idx = 0
+                        last_rgb = None
 
-                        for (
-                            video_frames,
-                            metrics,
-                        ) in self.imtalker_streamer.generate_stream(
+                        for video_frames, metrics in self.imtalker_streamer.generate_stream(
                             self.avatar_img, iter([audio_16k])
                         ):
                             for ft in video_frames:
                                 if frame_count >= expected_frames:
                                     del ft
-                                    continue  # Discard excess frames
+                                    continue
 
-                                # Convert frame tensor to VideoFrame
                                 frame_rgb = process_frame_tensor(ft, format="RGB")
 
-                                # Inter-chunk blending: smooth transition from previous chunk
                                 if (
                                     _prev_chunk_last_rgb_feed[0] is not None
                                     and frame_count < BLEND_FRAMES_FEED
                                 ):
                                     alpha = (frame_count + 1) / (BLEND_FRAMES_FEED + 1)
-                                    prev = _prev_chunk_last_rgb_feed[0].astype(
-                                        np.float32
-                                    )
+                                    prev = _prev_chunk_last_rgb_feed[0].astype(np.float32)
                                     curr = frame_rgb.astype(np.float32)
                                     frame_rgb = (
                                         (1 - alpha) * prev + alpha * curr
                                     ).astype(np.uint8)
 
                                 last_rgb = frame_rgb.copy()
-                                # Crop-Infer-Paste: composite face into full image
                                 output_rgb = self.paste_back_frame(frame_rgb)
-                                av_frame = VideoFrame.from_ndarray(
-                                    output_rgb, format="rgb24"
-                                )
-                                last_av_frame = av_frame
+                                av_frame = VideoFrame.from_ndarray(output_rgb, format="rgb24")
                                 del ft, frame_rgb, output_rgb
 
-                                # Exactly SAMPLES_PER_FRAME per frame (zero-pad last)
-                                audio_slice = np.zeros(
-                                    SAMPLES_PER_FRAME, dtype=np.float32
-                                )
-                                avail = min(
-                                    SAMPLES_PER_FRAME,
-                                    total_audio_samples - audio_cursor,
-                                )
-                                if avail > 0:
-                                    audio_slice[:avail] = audio_24k_clipped[
-                                        audio_cursor : audio_cursor + avail
-                                    ]
-                                audio_cursor += SAMPLES_PER_FRAME
-
-                                audio_slice_int16 = (audio_slice * 32767).astype(
-                                    np.int16
-                                )
-
-                                pair = (av_frame, audio_slice_int16)
-
-                                # Push directly to av_queue (backpressure via maxsize=30)
+                                # Push video frame to video track
                                 fut = asyncio.run_coroutine_threadsafe(
-                                    av_queue.put(pair), self._loop
+                                    self.video_track.frame_queue.put(av_frame), self._loop
                                 )
                                 fut.result(timeout=10)
+
+                                # Push corresponding audio frames in lockstep
+                                for _ in range(AUDIO_FRAMES_PER_VIDEO_FEED):
+                                    if audio_frame_idx < len(audio_webrtc_frames):
+                                        afut = asyncio.run_coroutine_threadsafe(
+                                            self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                            self._loop
+                                        )
+                                        afut.result(timeout=10)
+                                        audio_frame_idx += 1
+
                                 frame_count += 1
                             del video_frames
 
-                        # Pad with duplicate last frame if IMTalker produced fewer than expected
-                        while (
-                            frame_count < expected_frames and last_av_frame is not None
-                        ):
-                            audio_slice = np.zeros(SAMPLES_PER_FRAME, dtype=np.float32)
-                            avail = min(
-                                SAMPLES_PER_FRAME, total_audio_samples - audio_cursor
+                        if frame_count > 0 and frame_count < expected_frames:
+                            last_frame = VideoFrame.from_ndarray(
+                                self.paste_back_frame(last_rgb) if last_rgb is not None
+                                else np.zeros((512, 512, 3), dtype=np.uint8),
+                                format="rgb24"
                             )
-                            if avail > 0:
-                                audio_slice[:avail] = audio_24k_clipped[
-                                    audio_cursor : audio_cursor + avail
-                                ]
-                            audio_cursor += SAMPLES_PER_FRAME
-                            audio_slice_int16 = (audio_slice * 32767).astype(np.int16)
-                            fut = asyncio.run_coroutine_threadsafe(
-                                av_queue.put((last_av_frame, audio_slice_int16)),
-                                self._loop,
-                            )
-                            fut.result(timeout=10)
-                            frame_count += 1
+                            while frame_count < expected_frames:
+                                fut = asyncio.run_coroutine_threadsafe(
+                                    self.video_track.frame_queue.put(last_frame),
+                                    self._loop,
+                                )
+                                fut.result(timeout=10)
+                                for _ in range(AUDIO_FRAMES_PER_VIDEO_FEED):
+                                    if audio_frame_idx < len(audio_webrtc_frames):
+                                        afut = asyncio.run_coroutine_threadsafe(
+                                            self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                            self._loop
+                                        )
+                                        afut.result(timeout=10)
+                                        audio_frame_idx += 1
+                                frame_count += 1
 
-                        if frame_count != expected_frames:
-                            print(
-                                f"⚠️  SYNC: chunk {chunk_idx} expected {expected_frames} frames, got {frame_count}"
+                        # Push any remaining audio frames
+                        while audio_frame_idx < len(audio_webrtc_frames):
+                            afut = asyncio.run_coroutine_threadsafe(
+                                self.audio_track.audio_queue.put(audio_webrtc_frames[audio_frame_idx]),
+                                self._loop
                             )
+                            afut.result(timeout=10)
+                            audio_frame_idx += 1
 
-                        del audio_16k, audio_24k_clipped
-                        # Save last frame RGB for blending into next chunk
+                        del audio_16k
                         _prev_chunk_last_rgb_feed[0] = last_rgb
+
+                        if self.sync_manager:
+                            self.sync_manager.notify_video_content(frame_count)
+
                         return frame_count
 
                     frame_count = await self._loop.run_in_executor(
-                        None, render_and_stream
+                        None, render_and_push_av
                     )
                     render_time = time.time() - t_render
                     render_total_time += render_time
+                    total_frames += frame_count
                     del audio_24k_np
 
                     print(
-                        f"⏱️  Render chunk {chunk_idx}: {render_time:.3f}s → {frame_count} A/V pairs (streamed)"
+                        f"⏱️  Render chunk {chunk_idx}: {render_time:.3f}s → {frame_count} video frames"
                     )
                     pipeline_timings["render_per_chunk"].append({
                         "chunk_text": text_chunk,
@@ -4294,102 +4895,26 @@ class ConversationManager:
                         "frame_count": frame_count,
                     })
 
-                print(f"⏱️  Render total: {render_total_time:.3f}s")
-                pipeline_timings["render_total_time_s"] = round(render_total_time, 3)
-
-            # Stage 3: A/V streaming with pre-buffering and shared clock
-            PRE_BUFFER_FRAMES_FEED = 1  # OPTIMIZED: Reduced from 3→1 for faster first-byte-time (-80ms)
-
-            async def av_streamer():
-                """Push video and audio to SEPARATE track queues simultaneously.
-
-                Pre-buffers a few frames before starting tracks to absorb
-                rendering jitter. Uses shared wall-clock anchor for tight sync.
-                """
-                total_frames = 0
-                stream_start = None
-                pre_buffer = []
-                started = False
-
-                while True:
-                    item = await av_queue.get()
-                    if item is None:
-                        # If we never started (very short response), start now
-                        if not started and pre_buffer:
-                            clock = time.time()
-                            self.video_track.start_speaking(clock_anchor=clock)
-                            self.audio_track.reset_clock(clock_anchor=clock)
-                            for pf, pa in pre_buffer:
-                                audio_chunks = _split_audio_to_webrtc(pa)
-                                await self.video_track.frame_queue.put(pf)
-                                for chunk in audio_chunks:
-                                    await self.audio_track.audio_queue.put(chunk)
-                                total_frames += 1
-                            stream_start = clock
-                            started = True
-                            pre_buffer = None
-                        break
-
-                    av_frame, audio_slice_int16 = item
-
-                    if not started:
-                        pre_buffer.append((av_frame, audio_slice_int16))
-                        if len(pre_buffer) >= PRE_BUFFER_FRAMES_FEED:
-                            clock = time.time()
-                            self.video_track.start_speaking(clock_anchor=clock)
-                            self.audio_track.reset_clock(clock_anchor=clock)
-                            for pf, pa in pre_buffer:
-                                audio_chunks = _split_audio_to_webrtc(pa)
-                                await self.video_track.frame_queue.put(pf)
-                                for chunk in audio_chunks:
-                                    await self.audio_track.audio_queue.put(chunk)
-                                total_frames += 1
-                            stream_start = clock
-                            started = True
-                            pre_buffer = None
-                            print(
-                                f"CM: First A/V pair — tracks synchronized ({PRE_BUFFER_FRAMES_FEED} pre-buffered)"
-                            )
-                        continue
-
-                    # Normal flow: push to separate queues
-                    audio_chunks = _split_audio_to_webrtc(audio_slice_int16)
-                    await self.video_track.frame_queue.put(av_frame)
-                    for chunk in audio_chunks:
-                        await self.audio_track.audio_queue.put(chunk)
-
-                    total_frames += 1
-                    self.last_chunk_final_frame = av_frame
-
-                    if self.sync_manager:
-                        self.sync_manager.notify_video_content(1)
-                        self.sync_manager.notify_audio_content(len(audio_slice_int16))
-
-                # Signal that no more frames are coming
+                # All A/V frames delivered — signal completion
+                self.audio_track.stop_expecting()
                 self.video_track.mark_speech_ending()
 
-                # Wait for queues to drain before stopping speech.
-                if stream_start and total_frames > 0:
+                if total_frames > 0:
                     total_duration = total_frames * 0.04
-                    elapsed_so_far = time.time() - stream_start
+                    elapsed_so_far = time.time() - pipeline_start
                     remaining = total_duration - elapsed_so_far + 0.08
                     if remaining > 0:
                         await asyncio.sleep(remaining)
 
-                # Speech finished — resume idle animation
-                self.audio_track.stop_expecting()
                 self.video_track.stop_speaking()
 
-                elapsed = time.time() - stream_start if stream_start else 0
-                fps_actual = total_frames / elapsed if elapsed > 0 else 0
-                print(
-                    f"CM: Streamed {total_frames} A/V pairs in {elapsed:.2f}s ({fps_actual:.1f} FPS)"
-                )
-                pipeline_timings["streaming_time_s"] = round(elapsed, 3)
+                print(f"⏱️  Render total: {render_total_time:.3f}s → {total_frames} frames")
+                pipeline_timings["render_total_time_s"] = round(render_total_time, 3)
+                pipeline_timings["streaming_time_s"] = round(time.time() - pipeline_start, 3)
                 pipeline_timings["total_frames"] = total_frames
 
-            # Run all stages concurrently
-            await asyncio.gather(audio_chunker(), renderer(), av_streamer())
+            # Run all stages concurrently — TTS runs ahead, but A/V pushed in lockstep
+            await asyncio.gather(audio_chunker(), parallel_av_handler(), video_renderer())
 
             pipeline_timings["status"] = "completed"
             pipeline_timings["total_pipeline_time_s"] = round(time.time() - pipeline_start, 3)
