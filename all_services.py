@@ -2760,6 +2760,19 @@ class OpenAIRealtimeSession:
         # Audio resampler cache
         self._resample_cache = {}
 
+        # Mic audio accumulation buffer: accumulate ~100ms of audio before
+        # resampling+sending. This eliminates FFT edge artifacts from resampling
+        # tiny 20ms WebRTC frames independently.
+        self._mic_buffer = np.array([], dtype=np.float32)
+        self._mic_buffer_sr = None
+        self._MIC_BUFFER_FLUSH_SAMPLES = 960 * 5  # 5 WebRTC frames (~100ms at 48kHz)
+
+        # High-pass filter state (removes sub-80Hz mic rumble that confuses VAD)
+        # Maintained across calls to avoid transients at chunk boundaries.
+        self._hp_filter_initialized = False
+        self._hp_sos = None
+        self._hp_zi = None
+
         # Track current response accumulation
         self._current_response_text = ""
         self._current_response_id = None
@@ -2982,8 +2995,9 @@ class OpenAIRealtimeSession:
     async def send_audio(self, audio_np: np.ndarray, sample_rate: int):
         """Send PCM audio to the Realtime API input buffer.
 
-        Resamples to 24kHz PCM16 and base64-encodes for the WebSocket protocol.
-        This should be called for every microphone audio frame.
+        Accumulates ~100ms of audio before resampling to 24kHz PCM16 and sending.
+        This eliminates FFT edge artifacts from resampling tiny 20ms WebRTC frames.
+        Uses polyphase resampling, high-pass filter, and AGC for maximum clarity.
 
         Args:
             audio_np: Audio samples as numpy array (any dtype)
@@ -3018,25 +3032,79 @@ class OpenAIRealtimeSession:
                     return
                 audio_f32 = np.nan_to_num(audio_f32)
 
-            # Resample to 24kHz if needed
-            if sample_rate != self.TARGET_SAMPLE_RATE:
-                # Use scipy for high-quality resampling with anti-aliasing
-                # Linear interpolation (np.interp) introduces artifacts that degrade speech recognition
-                new_len = int(len(audio_f32) * self.TARGET_SAMPLE_RATE / sample_rate)
-                audio_f32 = signal.resample(audio_f32, new_len)
+            # Accumulate audio in buffer (avoids resampling tiny 20ms chunks)
+            if self._mic_buffer_sr is not None and self._mic_buffer_sr != sample_rate:
+                # Sample rate changed — flush old buffer first
+                await self._flush_mic_buffer()
+            self._mic_buffer_sr = sample_rate
+            self._mic_buffer = np.concatenate([self._mic_buffer, audio_f32])
 
-                # Debug: Log resampling quality check (only occasionally to avoid spam)
-                if not hasattr(self, "_resample_log_count"):
-                    self._resample_log_count = 0
-                if self._resample_log_count % 50 == 0:  # Log every 50th frame
-                    rms = np.sqrt(np.mean(audio_f32**2))
-                    print(
-                        f"🎤 Audio resampled: {sample_rate}Hz→24kHz, RMS={rms:.4f}, samples={len(audio_f32)}"
-                    )
-                self._resample_log_count += 1
+            # When enough accumulated (~100ms), process and send
+            if len(self._mic_buffer) >= self._MIC_BUFFER_FLUSH_SAMPLES:
+                await self._flush_mic_buffer()
 
-            # Convert to PCM16 bytes
-            pcm16 = (np.clip(audio_f32, -1.0, 1.0) * 32767).astype(np.int16)
+        except websockets.exceptions.ConnectionClosed:
+            print("🔌 OpenAI Realtime: Connection closed while sending audio")
+            self._connected = False
+            asyncio.create_task(self._try_reconnect())
+        except Exception as e:
+            # Don't spam logs for transient send errors
+            if (
+                not hasattr(self, "_last_send_err_time")
+                or time.time() - self._last_send_err_time > 5
+            ):
+                print(f"🔌 OpenAI Realtime: Send audio error: {e}")
+                self._last_send_err_time = time.time()
+
+    async def _flush_mic_buffer(self):
+        """Process accumulated mic audio: high-pass filter, resample, AGC, and send to OpenAI."""
+        if len(self._mic_buffer) == 0 or not self._connected or self._ws is None:
+            return
+
+        audio = self._mic_buffer.copy()
+        sr = self._mic_buffer_sr or 48000
+        self._mic_buffer = np.array([], dtype=np.float32)
+
+        try:
+            # 1. High-pass filter at 80Hz — removes mic rumble, HVAC, breathing noise
+            #    that confuses OpenAI's VAD. Filter state is maintained across calls
+            #    to avoid transients at chunk boundaries.
+            if not self._hp_filter_initialized or self._hp_sos is None:
+                self._hp_sos = signal.butter(2, 80, btype='highpass', fs=sr, output='sos')
+                self._hp_zi = signal.sosfilt_zi(self._hp_sos) * 0.0
+                self._hp_filter_initialized = True
+            audio, self._hp_zi = signal.sosfilt(self._hp_sos, audio, zi=self._hp_zi)
+            audio = audio.astype(np.float32)
+
+            # 2. Resample to 24kHz using polyphase filter (NOT FFT-based signal.resample)
+            #    Polyphase avoids spectral ringing on chunk boundaries that degrades
+            #    Whisper transcription accuracy.
+            if sr != self.TARGET_SAMPLE_RATE:
+                g = math.gcd(int(sr), int(self.TARGET_SAMPLE_RATE))
+                up = int(self.TARGET_SAMPLE_RATE) // g
+                down = int(sr) // g
+                audio = signal.resample_poly(audio, up, down).astype(np.float32)
+
+            # 3. AGC (Automatic Gain Control) — boost quiet microphones so VAD
+            #    and Whisper can reliably detect and transcribe speech.
+            peak = np.max(np.abs(audio))
+            if 0.0 < peak < 0.1:
+                # Audio is very quiet — boost to ~50% of full scale
+                gain = min(0.5 / peak, 10.0)  # cap at 10x to avoid amplifying noise
+                audio = audio * gain
+
+            # Debug: Log audio stats periodically
+            if not hasattr(self, "_resample_log_count"):
+                self._resample_log_count = 0
+            if self._resample_log_count % 20 == 0:  # Log every ~2s
+                rms = np.sqrt(np.mean(audio**2))
+                print(
+                    f"🎤 Mic audio: {sr}Hz→24kHz, RMS={rms:.4f}, peak={np.max(np.abs(audio)):.4f}, samples={len(audio)}"
+                )
+            self._resample_log_count += 1
+
+            # 4. Convert to PCM16 bytes and send
+            pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
             audio_b64 = base64.b64encode(pcm16.tobytes()).decode("ascii")
 
             event = {
@@ -3050,12 +3118,11 @@ class OpenAIRealtimeSession:
             self._connected = False
             asyncio.create_task(self._try_reconnect())
         except Exception as e:
-            # Don't spam logs for transient send errors
             if (
                 not hasattr(self, "_last_send_err_time")
                 or time.time() - self._last_send_err_time > 5
             ):
-                print(f"🔌 OpenAI Realtime: Send audio error: {e}")
+                print(f"🔌 OpenAI Realtime: Flush mic buffer error: {e}")
                 self._last_send_err_time = time.time()
 
     async def _listen_loop(self):
@@ -3449,6 +3516,12 @@ class OpenAIRealtimeSession:
         """Cleanly disconnect from the Realtime API."""
         self._should_run = False
 
+        # Flush any remaining accumulated mic audio before closing
+        try:
+            await self._flush_mic_buffer()
+        except Exception:
+            pass
+
         if self._listen_task and not self._listen_task.done():
             self._listen_task.cancel()
             try:
@@ -3465,6 +3538,10 @@ class OpenAIRealtimeSession:
             self._ws = None
 
         self._connected = False
+        # Reset filter state for next session
+        self._hp_filter_initialized = False
+        self._hp_zi = None
+        self._mic_buffer = np.array([], dtype=np.float32)
         print("🔌 OpenAI Realtime: Disconnected")
 
     @property
@@ -3648,8 +3725,12 @@ class ConversationManager:
                 on_speech_started=self._on_realtime_speech_started,
                 on_speech_stopped=self._on_realtime_speech_stopped,
                 on_user_transcript=self._on_realtime_user_transcript,
-                # OPTIMIZED for faster response time (-500-800ms total):
-                vad_silence_duration_ms=400,  # Reduced from 700ms default (-300ms perceived latency)
+                # VAD tuning: lower threshold for better sensitivity, longer silence
+                # tolerance so natural pauses don't trigger end-of-turn, more prefix
+                # padding to capture the start of speech reliably.
+                vad_threshold=0.3,  # Lowered from 0.5 default — detects softer speech
+                vad_prefix_padding_ms=500,  # Raised from 300ms — captures more speech onset
+                vad_silence_duration_ms=550,  # Balanced: 400 was too aggressive (cut off mid-sentence), 700 too slow
                 max_output_tokens=500,  # Raised: 100 caused silent truncation (status=incomplete) on detailed topics
                 temperature=0.9,  # Increased from 0.7 default (-50-100ms LLM time)
                 # Knowledge Base RAG via function calling
