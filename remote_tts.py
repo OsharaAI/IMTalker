@@ -185,12 +185,34 @@ class RemoteChatterboxTTS:
             upload_url = f"{self.server_url}/upload_reference"
             with open(wav_fpath, "rb") as f:
                 resp = requests.post(upload_url, files={"files": (ref_filename, f, "audio/wav")})
+            
             if resp.status_code == 200:
                 self._reference_audio_filename = ref_filename
                 logger.info(f"Uploaded reference audio to STTS server: {ref_filename}")
             else:
-                logger.warning(f"Failed to upload reference audio to {upload_url}: {resp.status_code} {resp.text}")
-                self._reference_audio_filename = None
+                # Parse error details from response
+                try:
+                    error_data = resp.json()
+                    errors = error_data.get("errors", [])
+                    if errors:
+                        error_details = "; ".join([f"{e.get('filename', 'unknown')}: {e.get('error', 'unknown error')}" for e in errors])
+                        logger.warning(f"Failed to upload reference audio to {upload_url}: {error_details}")
+                    else:
+                        logger.warning(f"Failed to upload reference audio to {upload_url}: {resp.status_code} - {error_data.get('message', resp.text)}")
+                except Exception:
+                    logger.warning(f"Failed to upload reference audio to {upload_url}: {resp.status_code} {resp.text}")
+                
+                # Still set filename if file already exists on server
+                try:
+                    response_data = resp.json()
+                    all_files = response_data.get("all_reference_files", [])
+                    if ref_filename in all_files:
+                        logger.info(f"Reference audio '{ref_filename}' already exists on server, using it anyway")
+                        self._reference_audio_filename = ref_filename
+                    else:
+                        self._reference_audio_filename = None
+                except Exception:
+                    self._reference_audio_filename = None
         except Exception as e:
             logger.warning(f"Could not upload reference audio to STTS server: {e}")
             self._reference_audio_filename = None
