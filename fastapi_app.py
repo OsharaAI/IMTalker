@@ -102,6 +102,89 @@ except ImportError:
     print("Warning: librosa not installed. Audio resampling may not work. Install with: pip install librosa")
     librosa = None
 
+# Expose ONNX models (client-side renderer) under /models
+app.mount(
+    "/models",
+    StaticFiles(directory="onnx_models"),
+    name="models",
+)
+
+
+@app.post("/split-generate")
+async def split_generate(
+    source_image: UploadFile = File(...),
+    driving_audio: UploadFile = File(...),
+    crop: bool = Form(True),
+    seed: int = Form(42),
+    nfe: int = Form(10),
+    cfg_scale: float = Form(2.0),
+    include_features: bool = Form(False),
+):
+    """
+    Generate motion latents from image and audio for client-side rendering.
+
+    By default this endpoint returns only the minimal payload needed by the
+    browser pipeline: `latents` + `metadata`.
+
+    Set `include_features=true` to also return renderer feature maps for
+    debugging or legacy clients.
+    """
+    try:
+        # Load inputs
+        image_data = await source_image.read()
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
+            tmp_audio.write(await driving_audio.read())
+            audio_path = tmp_audio.name
+
+        # Run Generator
+        with torch.inference_mode():
+            # Preprocess
+            s_pil = agent.data_processor.process_img(image) if crop else image.resize((cfg.input_size, cfg.input_size))
+            s_tensor = agent.data_processor.transform(s_pil).unsqueeze(0).to(agent.device)
+            a_tensor = agent.data_processor.process_audio(audio_path).unsqueeze(0).to(agent.device)
+            
+            # Encode source image into reference latent for generator conditioning
+            t_lat = agent.renderer.latent_token_encoder(s_tensor)
+            if isinstance(t_lat, tuple): t_lat = t_lat[0]
+            
+            data = {'s': s_tensor, 'a': a_tensor, 'pose': None, 'cam': None, 'gaze': None, 'ref_x': t_lat}
+            sample, _ = agent.generator.sample(data, a_cfg_scale=cfg_scale, nfe=nfe, seed=seed)
+            
+            # Stabilization
+            motion_scale = 0.6
+            sample = (1.0 - motion_scale) * t_lat.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
+            
+            # Convert to list for JSON response
+            latents = sample.cpu().numpy().tolist()
+
+            response_payload = {
+                "status": "success",
+                "latents": latents,
+                "metadata": {
+                    "frames": sample.shape[1],
+                    "fps": cfg.fps,
+                    "latent_dim": sample.shape[-1],
+                },
+            }
+
+            if include_features:
+                # Optional heavy debug payload for legacy experiments.
+                f_r, g_r = agent.renderer.dense_feature_encoder(s_tensor)
+                response_payload["g_r"] = [t.cpu().numpy().tolist() for t in g_r]
+                response_payload["f_r"] = [t.cpu().numpy().tolist() for t in f_r]
+                response_payload["t_lat"] = t_lat.cpu().numpy().tolist()
+
+        # Cleanup
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+        return JSONResponse(response_payload)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ============================================================================
 # REAL-TIME CHUNKED AUDIO STREAMING
@@ -612,42 +695,45 @@ class InferenceAgent:
         # Stabilization: blend generated motion with reference motion to reduce large background/head movements
         motion_scale = 0.6  # More stabilization (was 0.75)
         sample = (1.0 - motion_scale) * t_lat.unsqueeze(1).repeat(1, sample.shape[1], 1) + motion_scale * sample
-
+        
         T = sample.shape[1]
         ta_r = self.renderer.adapt(t_lat, g_r)
         m_r = self.renderer.latent_token_decoder(ta_r)
-
+        
         # PROGRESSIVE PARALLEL HLS RENDERING - Streams as it renders!
         print(f"Progressive HLS: Rendering {T} frames with {self.opt.num_render_workers} workers...")
-        # self.parallel_renderer.render_progressive_hls(
-        #     sample, g_r, m_r, f_r,
-        #     hls_generator
-        # )
 
-        # Generate frames progressively
-        for t in range(T):
-            ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
-            m_c = self.renderer.latent_token_decoder(ta_c)
-            out_frame = self.renderer.decode(m_c, m_r, f_r)
+        if crop:
+            # Use optimized parallel renderer when we don't need paste-back onto the full frame
+            self.parallel_renderer.render_progressive_hls(
+                sample, g_r, m_r, f_r,
+                hls_generator
+            )
+        else:
+            # Fallback to per-frame loop when paste-back onto the original image is required
+            for t in range(T):
+                ta_c = self.renderer.adapt(sample[:, t, ...], g_r)
+                m_c = self.renderer.latent_token_decoder(ta_c)
+                out_frame = self.renderer.decode(m_c, m_r, f_r)
 
-            if full_img_tensor is not None:
-                # GPU Paste Back
-                out_frame = self.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
+                if full_img_tensor is not None:
+                    # GPU Paste Back
+                    out_frame = self.data_processor.paste_back_tensor(out_frame, full_img_tensor, coords)
 
-            # Convert frame to numpy for HLS generator
-            frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
-            if frame_np.min() < 0:
-                frame_np = (frame_np + 1) / 2
-            frame_np = np.clip(frame_np, 0, 1)
-            frame_np = (frame_np * 255).astype(np.uint8)
+                # Convert frame to numpy for HLS generator
+                frame_np = out_frame.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+                if frame_np.min() < 0:
+                    frame_np = (frame_np + 1) / 2
+                frame_np = np.clip(frame_np, 0, 1)
+                frame_np = (frame_np * 255).astype(np.uint8)
 
-            # Add frame to HLS generator (will create segments automatically)
-            hls_generator.add_frame(frame_np)
-
-            # Clear cache periodically
-            if t % 10 == 0 and self.device == "mps":
-                torch.mps.empty_cache()
-
+                # Add frame to HLS generator (will create segments automatically)
+                hls_generator.add_frame(frame_np)
+                
+                # Clear cache periodically
+                if t % 10 == 0 and self.device == "mps":
+                    torch.mps.empty_cache()
+        
         # Finalize HLS stream - mark complete only if this is the final chunk
         hls_generator.finalize(audio_path=aud_path, mark_complete=is_final_chunk)
 
